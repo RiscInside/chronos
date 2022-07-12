@@ -1,0 +1,2 @@
+*.c text eol=lf linguist-language=C
+*.h text eol=lf linguist-language=C
