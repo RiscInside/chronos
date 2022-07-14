@@ -21,13 +21,10 @@ void *other_thread_func(void *arg) {
 	timeline_event_happened(&ev_cnt, 1);
 	printf("other thread up\n");
 
-	// wrooom
-	chronos_set_tdf(10.0);
-
-	timeline_spin_for(1000);
-	timeline_event_happened(&ev_cnt, 2);
+	chronos_jump(1000000000);
 
 	chronos_rt_detatch();
+	timeline_event_happened(&ev_cnt, 3);
 	printf("other thread done\n");
 	return NULL;
 }
@@ -56,7 +53,7 @@ int main() {
 	}
 
 	timeline_spin_for(500);
-	timeline_event_happened(&ev_cnt, 3);
+	timeline_event_happened(&ev_cnt, 2);
 
 	pthread_join(other_thread, NULL);
 

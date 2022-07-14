@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <assert.h>
 #include <chronos.h>
 #include <errno.h>
 #include <pairing_heap.h>
@@ -15,8 +16,12 @@
 #include <string.h>
 #include <unistd.h>
 
-// TDF granularity. TDF is then stored as (size_t)double_tdf * TDF_UNIT
+// TDF granularity. TDF is then stored as (size_t)(double_tdf * (double)TDF_UNIT)
 #define TDF_UNIT 1000000
+
+// Max permitted vruntime difference (/ vruntime_step) for threads running within the same round. Prevents threads from
+// getting to far ahead in virtual time and still being scheduled.
+#define MAX_VRUNTIME_DIFF_FACTOR 2.0
 
 // Chronos runtime instance.
 struct chronos_rt {
@@ -64,6 +69,8 @@ struct chronos_thread_state {
 	size_t tdf;
 	// Deadline (as specified by the scheduler thread)
 	size_t relative_timer_deadline;
+	// Target vruntime at round completition
+	size_t completition_vruntime;
 	// Thread's expiration timer
 	timer_t timer;
 };
@@ -136,13 +143,26 @@ static void *chronos_rt_scheduler(void *arg) {
 		}
 		size_t runnable_threads = 0;
 		// pick threads for each CPU
+		bool some_thread_picked = false;
+		size_t vruntime_threshold = 0;
 		for (size_t i = 0; i < rt->cpusetsize; ++i) {
 			if (CPU_ISSET_S(i, rt->cpu_alloc_size, rt->mask)) {
-				pairing_heap_node_t *node = pairing_heap_del_min(&rt->heap);
+				// pick thread with lowest vruntime from the queue
+				pairing_heap_node_t *node = pairing_heap_get_min(&rt->heap);
 				if (node == NULL) {
 					break;
 				}
 				struct chronos_thread_state *tcb = (struct chronos_thread_state *)node;
+				if (!some_thread_picked) {
+					some_thread_picked = true;
+					vruntime_threshold = tcb->vruntime + (size_t)((double)rt->vruntime_step * MAX_VRUNTIME_DIFF_FACTOR);
+				}
+				// check that thread vruntime is within appropriate bounds
+				if (tcb->vruntime > vruntime_threshold) {
+					break;
+				}
+				// delete thread from the runqueue
+				pairing_heap_del_min(&rt->heap);
 				// calculate how long thread should run for
 				tcb->relative_timer_deadline = (rt->vruntime_step * tcb->average_tdf) / TDF_UNIT;
 				// start the thread
@@ -168,6 +188,19 @@ static void *chronos_rt_scheduler(void *arg) {
 static void chronos_schedule_timer_in(size_t nsec) {
 	struct itimerspec its;
 	chronos_nsec_to_timespec(&its.it_value, nsec);
+	its.it_interval.tv_nsec = 0;
+	its.it_interval.tv_sec = 0;
+	if (timer_settime(chronos_tcb->timer, 0, &its, NULL)) {
+		dprintf(2, "libchronos: timer_settime failed\n");
+		abort();
+	}
+}
+
+// Disarm timer
+static void chronos_disarm_timer() {
+	struct itimerspec its;
+	its.it_value.tv_nsec = 0;
+	its.it_value.tv_sec = 0;
 	its.it_interval.tv_nsec = 0;
 	its.it_interval.tv_sec = 0;
 	if (timer_settime(chronos_tcb->timer, 0, &its, NULL)) {
@@ -213,8 +246,8 @@ static void chronos_signal_this_timeslice_done() {
 	sem_post(&chronos_tcb->rt->notify_sched_sem);
 }
 
-// Timer signal handler
-static void chronos_timer_handler() {
+// Preemption handler
+static void chronos_on_round_end() {
 	chronos_update_runtimes();
 	// Calculate average TDF for the scheduler
 	size_t ns_delta = chronos_nsecs_since_epoch() - chronos_tcb->round_start_ns;
@@ -228,6 +261,76 @@ static void chronos_timer_handler() {
 	chronos_wait_from_ack_from_sched();
 }
 
+static __thread volatile sig_atomic_t chronos_disable_preemption = 0;
+static __thread volatile sig_atomic_t chronos_preemption_pending = 0;
+
+// Signal preemtion
+static void chronos_signal_preemption() {
+	if (chronos_preemption_pending) {
+		return;
+	} else if (chronos_disable_preemption) {
+		chronos_preemption_pending = 1;
+	} else {
+		chronos_on_round_end();
+	}
+}
+
+// Enter critical section (disable rescheduling). Returns critical section id that is to be passed to
+// chronos_exit_critical
+int chronos_enter_critical() {
+	if (chronos_disable_preemption) {
+		return 1;
+	}
+	chronos_disable_preemption = 1;
+	return 0;
+}
+
+// Exit critical section (enable rescheduling). Accepts critical section id from chronos_enter_critical
+static void chronos_exit_critical_impl(int section_id) {
+	assert(chronos_disable_preemption);
+	if (section_id == 1) {
+		return;
+	}
+	chronos_disable_preemption = 0;
+	if (chronos_preemption_pending) {
+		// Timer interrupt arrived while we were in critical section
+		// Run deferred preemption routine now
+		chronos_preemption_pending = 0;
+		chronos_on_round_end();
+	}
+}
+
+// Do vruntime check and see if its time to preempt. Run with preemption disabled
+static void chronos_vruntime_check_impl() {
+	assert(chronos_disable_preemption);
+	if (chronos_tcb->vruntime > chronos_tcb->completition_vruntime) {
+		// stop timer. We don't have to per se, but why not
+		chronos_disarm_timer();
+		// this will have effect as soon as we exit the outermost critical section
+		chronos_signal_preemption();
+	}
+}
+
+// Public exit critical section function. Checks vruntime
+void chronos_exit_critical(int section_id) {
+	chronos_update_runtimes();
+	chronos_vruntime_check_impl();
+	chronos_exit_critical_impl(section_id);
+}
+
+// Check that vruntime is wtihin bounds and preempt if necessary. Won't have effect until outermost critical section is
+// exited.
+void chronos_vruntime_check() {
+	if (chronos_disable_preemption) {
+		// chronos_exit_criticial will do the check
+		return;
+	}
+	// Vruntime check requires that we run inside a critical section
+	// chronos_exit_critical() does a vruntime check on its own
+	// Hence entering critical section and exitiing it immediatelly does the trick
+	chronos_exit_critical(chronos_enter_critical());
+}
+
 // Set up timer
 static void chronos_set_up_timer() {
 	// Set up SIGALRM singal handler
@@ -235,7 +338,7 @@ static void chronos_set_up_timer() {
 	struct sigaction sa;
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;
-	sa.sa_handler = &chronos_timer_handler;
+	sa.sa_handler = &chronos_signal_preemption;
 	if (sigaction(TIMER_VECTOR, &sa, NULL)) {
 		dprintf(2, "libchronos: sigaction failed\n");
 		abort();
@@ -352,11 +455,11 @@ void chronos_rt_submit(void *rt_token, size_t initial_vruntime) {
 }
 
 void chronos_rt_detatch() {
-	// Disarm timer
+	// Delete timer, we won't need it anymore
 	timer_delete(chronos_tcb->timer);
 	// TODO: switch to a different CPU
-	// Tell scheduler we have finished running this timeslice. We have not enqueued this thread into runqueue, so this
-	// thread is not coming back
+	// Tell scheduler we have finished running this timeslice. We have not enqueued this thread into runqueue, so
+	// this thread is not coming back
 	chronos_signal_this_timeslice_done();
 	// And we are done... Scheduler thread does not know we exist anymore
 	sem_destroy(&chronos_tcb->sched_go_ahead_sem);
@@ -365,12 +468,19 @@ void chronos_rt_detatch() {
 }
 
 void chronos_set_tdf(double tdf) {
+	chronos_vruntime_check();
 	size_t tdf_as_int = (size_t)((double)TDF_UNIT * tdf);
 	chronos_update_runtimes();
 	chronos_tcb->tdf = tdf_as_int;
 }
 
+void chronos_jump(size_t delta_ns) {
+	chronos_tcb->vruntime += delta_ns;
+	chronos_vruntime_check();
+}
+
 size_t chronos_get_vruntime() {
+	chronos_vruntime_check();
 	chronos_update_runtimes();
 	return chronos_tcb->vruntime;
 }

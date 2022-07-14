@@ -29,3 +29,17 @@ void chronos_set_tdf(double tdf);
 
 // Get vruntime
 size_t chronos_get_vruntime();
+
+// Jump delta_ns nanoseconds forward in virtual time
+void chronos_jump(size_t delta_ns);
+
+// Enter critical section (disable rescheduling). Returns critical section id that is to be passed to
+// chronos_exit_critical
+int chronos_enter_critical();
+
+// Exit critical section (enable rescheduling). Accepts critical section id from chronos_enter_critical
+void chronos_exit_critical(int section_id);
+
+// Check that vruntime is wtihin bounds and preempt if necessary. Won't have effect until outermost critical section is
+// exited.
+void chronos_vruntime_check();
