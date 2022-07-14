@@ -15,31 +15,31 @@
 // thread that runs with SCHED_FIFO priority as well
 // vruntime_step specifies scheduler precision: chronos will attempt to run threads for vruntime_step during each round
 // This function returns a runtime token that can be used to submit other threads to the runtime
-void *chronos_rt_init(size_t cpusetsize, cpu_set_t const *mask, size_t vruntime_step);
+void *chronosrt_init(size_t cpusetsize, cpu_set_t const *mask, size_t vruntime_step);
 
 // Submit current thread to the chronos runtime
-void chronos_rt_submit(void *rt_token, size_t initial_vruntime);
+void chronosrt_submit(void *rt_token, size_t initial_vruntime);
 
 // Detatch current thread from the chronos runtime
 // Call before exit()
-void chronos_rt_detatch();
+void chronosrt_detatch();
 
 // Set time dilation factor (1.0 - no/op, 2.0 - 2 times faster, 0.5 - 2 times slower)
-void chronos_set_tdf(double tdf);
+void chronosrt_set_tdf(double tdf);
 
 // Get vruntime
-size_t chronos_get_vruntime();
+size_t chronosrt_get_vruntime();
 
 // Jump delta_ns nanoseconds forward in virtual time
-void chronos_jump(size_t delta_ns);
+void chronosrt_jump(size_t delta_ns);
 
 // Enter critical section (disable rescheduling). Returns critical section id that is to be passed to
-// chronos_exit_critical
-int chronos_enter_critical();
+// chronosrt_exit_critical
+int chronosrt_enter_critical();
 
-// Exit critical section (enable rescheduling). Accepts critical section id from chronos_enter_critical
-void chronos_exit_critical(int section_id);
+// Exit critical section (enable rescheduling). Accepts critical section id from chronosrt_enter_critical
+void chronosrt_exit_critical(int section_id);
 
 // Check that vruntime is wtihin bounds and preempt if necessary. Won't have effect until outermost critical section is
 // exited.
-void chronos_vruntime_check();
+void chronosrt_check_vruntime();

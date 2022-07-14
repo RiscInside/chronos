@@ -2,7 +2,7 @@
 #define _GNU_SOURCE
 #endif
 
-#include <chronos.h>
+#include <chronosrt.h>
 #include <stdio.h>
 
 #include "timeline.h"
@@ -13,11 +13,11 @@ int main() {
 	CPU_SET(0, &set);
 	CPU_SET(1, &set);
 
-	chronos_rt_init(2, &set, 1000000);
+	chronosrt_init(2, &set, 1000000);
 	printf("runtime up\n");
 
 	timeline_spin_for(1000);
 
-	chronos_rt_detatch();
+	chronosrt_detatch();
 	printf("runtime down\n");
 }
