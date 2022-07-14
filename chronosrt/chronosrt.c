@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 // TDF granularity. TDF is then stored as (size_t)(double_tdf * (double)TDF_UNIT)
