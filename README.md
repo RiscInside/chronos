@@ -10,7 +10,7 @@ Virtual time executor that works fully in userspace.
 
 #### Planned
 
-- [ ] [chronos-sabre]() - SaBRe plugin for Chronos
+- [ ] [chronos-sabre]() - [SaBRe](https://github.com/srg-imperial/SaBRe) plugin for Chronos
 - [ ] [llvmchronos]() - LLVM plugin for rewriting LLVM bitcode to insert chronosrt calls
 
 ### Implementation details
