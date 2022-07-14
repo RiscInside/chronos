@@ -468,7 +468,6 @@ void chronosrt_detatch() {
 }
 
 void chronosrt_set_tdf(double tdf) {
-	chronosrt_vruntime_check();
 	size_t tdf_as_int = (size_t)((double)TDF_UNIT * tdf);
 	chronosrt_update_runtimes();
 	chronosrt_tcb->tdf = tdf_as_int;
