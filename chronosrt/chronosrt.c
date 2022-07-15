@@ -44,6 +44,8 @@ struct chronosrt {
 	pairing_heap_t heap;
 	// vruntime step target
 	size_t vruntime_step;
+	// runtime creation time
+	size_t creation_time;
 };
 
 // chronosrt thread-local state.
@@ -133,6 +135,8 @@ static void *chronosrt_scheduler(void *arg) {
 	chronosrt_send_tid_to_cpu(0, rt->scheduler_cpu_id, rt->scratch_mask, rt->cpusetsize, rt->cpu_alloc_size);
 	// Wait for the init thread to finish initialization
 	sem_wait(&rt->notify_sched_sem);
+	// Record creation time
+	rt->creation_time = chronosrt_nsecs_since_epoch();
 	// Runtime bootstrap done, enter main loop
 	while (true) {
 		// prepare for the new round, lock the runtime instance
@@ -480,7 +484,10 @@ void chronosrt_jump(size_t delta_ns) {
 }
 
 size_t chronosrt_get_vruntime() {
-	chronosrt_vruntime_check();
 	chronosrt_update_runtimes();
 	return chronosrt_tcb->vruntime;
+}
+
+size_t chronosrt_get_realtime() {
+	return chronosrt_nsecs_since_epoch() - chronosrt_tcb->rt->creation_time;
 }

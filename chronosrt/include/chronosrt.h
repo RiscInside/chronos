@@ -30,6 +30,9 @@ void chronosrt_set_tdf(double tdf);
 // Get vruntime
 size_t chronosrt_get_vruntime();
 
+// Get real time in nanoseconds since runtime creation
+size_t chronosrt_get_realtime();
+
 // Jump delta_ns nanoseconds forward in virtual time
 void chronosrt_jump(size_t delta_ns);
 

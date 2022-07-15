@@ -27,3 +27,7 @@ static void timeline_event_happened(timeline_event_cnt_t *cnt, size_t id) {
 		exit(EXIT_FAILURE);
 	}
 }
+
+#define timeline_timestamp(s)                                                                                          \
+	printf("[virtual: %zu ms, real: %zu ms] %s", chronosrt_get_vruntime() / 1000000,                                   \
+	       chronosrt_get_realtime() / 1000000, s)
