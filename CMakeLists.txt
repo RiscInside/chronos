@@ -7,4 +7,3 @@ include(CTest)
 include_directories(include)
 
 add_subdirectory(chronosrt)
-add_subdirectory(tests)
