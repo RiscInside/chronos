@@ -14,7 +14,7 @@
 
 #define BACKTRACE_MAX 20
 
-noreturn void fail(const char *fmt, ...) {
+noreturn void chronosrt_fail(const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 
