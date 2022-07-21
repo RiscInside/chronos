@@ -1,7 +1,8 @@
-#include <pairing_heap.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
+#include <pairing_heap.h>
 
 #define ELEMS 10
 

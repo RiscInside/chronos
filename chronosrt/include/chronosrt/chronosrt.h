@@ -17,8 +17,8 @@ void chronosrt_set_tdf(double new_tdf);
 
 void *chronosrt_new_thread_token(void);
 
-void chronosrt_attach_to_runtime(void *token);
+void chronosrt_attach(void *token);
 
-void chronosrt_detatch_from_runtime();
+void chronosrt_detach(void);
 
 #endif

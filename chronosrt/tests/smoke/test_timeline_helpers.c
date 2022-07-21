@@ -1,8 +1,9 @@
-#include "timeline.h"
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include <timeline.h>
 
 timeline_event_cnt_t ev_cnt = 0;
 

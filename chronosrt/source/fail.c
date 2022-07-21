@@ -20,9 +20,9 @@ noreturn void chronosrt_fail(const char *fmt, ...) {
 
 	int errno_value = errno;
 
-	dprintf(STDERR_FILENO, "[tid %d] ", gettid());
+	dprintf(STDERR_FILENO, "[%d] ", gettid());
 	vdprintf(STDERR_FILENO, fmt, args);
-	dprintf(STDERR_FILENO, "\nerrno value (might be irrelevant): %d (%s)\nbacktrace:\n", errno_value,
+	dprintf(STDERR_FILENO, "\nErrno value on chronosrt_fail entry: %d (%s)\nBacktrace:\n", errno_value,
 	        strerror(errno_value));
 
 	void *buffer[BACKTRACE_MAX];
@@ -30,7 +30,7 @@ noreturn void chronosrt_fail(const char *fmt, ...) {
 	int size = backtrace(buffer, BACKTRACE_MAX);
 	backtrace_symbols_fd(buffer, size, STDERR_FILENO);
 
-	dprintf(STDERR_FILENO, "end of backtrace\n");
+	dprintf(STDERR_FILENO, "End of backtrace\n");
 
 	va_end(args);
 	abort();
