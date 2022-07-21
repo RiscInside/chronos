@@ -23,7 +23,8 @@ add_sched_policy(runnable);
 add_sched_policy(barrier);
 add_sched_policy(suspended);
 
-void chronosrt_sched_policy_init(void) {
+void chronosrt_sched_policy_init(struct chronosrt_cfg *cfg) {
+	(void)cfg;
 	suspended_priority = sched_get_priority_min(SCHED_FIFO);
 	barrier_priority = suspended_priority + 1;
 	runnable_priority = barrier_priority + 1;

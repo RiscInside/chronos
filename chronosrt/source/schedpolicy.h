@@ -1,10 +1,11 @@
 #ifndef __CHRONOSRT_SCHED_POLICY_H__
 #define __CHRONOSRT_SCHED_POLICY_H__
 
+#include <chronosrt/chronosrt.h>
 #include <pthread.h>
 #include <sys/types.h>
 
-void chronosrt_sched_policy_init(void);
+void chronosrt_sched_policy_init(struct chronosrt_cfg *cfg);
 
 void chronosrt_sched_policy_set_scheduler(pid_t tid);
 void chronosrt_sched_policy_set_runnable(pid_t tid);

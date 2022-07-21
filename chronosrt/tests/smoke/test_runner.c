@@ -20,7 +20,8 @@ void *edgy_thread(void *arg) {
 }
 
 int main() {
-	chronosrt_sched_policy_init();
+	struct chronosrt_cfg cfg;
+	chronosrt_sched_policy_init(&cfg);
 
 	pthread_t pthread1, pthread2;
 	atomic_int var1 = 0, var2 = 0;
