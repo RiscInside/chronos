@@ -1,0 +1,16 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <fail.h>
+#include <nosignals.h>
+#include <signal.h>
+#include <stddef.h>
+
+void chronosrt_disable_signals() {
+#ifdef CHRONOSRT_MASK_SIGNALS
+	sigset_t mask;
+	CHRONOSRT_ASSERT_FALSE(sigfillset(&mask));
+	CHRONOSRT_ASSERT_FALSE(sigprocmask(SIG_SETMASK, &mask, NULL));
+#endif
+}

@@ -2,492 +2,330 @@
 #define _GNU_SOURCE
 #endif
 
-#include <assert.h>
-#include <chronosrt.h>
-#include <errno.h>
-#include <pairing_heap.h>
+#include <asm/prctl.h>
+#include <linux/bpf.h>
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
-#include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
-// TDF granularity. TDF is then stored as (size_t)(double_tdf * (double)TDF_UNIT)
-#define TDF_UNIT 1000000
+#include <chronosrt/chronosrt.h>
+#include <chronosrt/cpuset.h>
+#include <fail.h>
+#include <log.h>
+#include <nosignals.h>
+#include <ns.h>
+#include <pairing_heap.h>
+#include <runner.h>
+#include <schedpolicy.h>
+#include <spinlock.h>
+#include <vruntime.h>
 
-// Max permitted vruntime difference (/ vruntime_step) for threads running within the same round. Prevents threads from
-// getting to far ahead in virtual time and still being scheduled.
-#define MAX_VRUNTIME_DIFF_FACTOR 2.0
+struct chronosrt_tcb {
+	struct chronosrt_vruntime vruntime_info;
+	pairing_heap_node_t queue_node;
+	struct chronosrt_tcb *self;
+	struct chronosrt_tcb *next_new_thread;
+	struct chronosrt_cpu *running_on_cpu;
+	pid_t tid;
+	bool first_time;
+};
 
-// chronosrt runtime instance.
+// Can be assigned from within the critical section to tell per-cpu scheduler what to do once the timeslice expires
+enum chronosrt_timeslice_status {
+	CHRONOSRT_AGAIN = 0,
+	CHRONOSRT_DETACH = 1,
+};
+
+struct chronosrt_cpu {
+	struct chronosrt_runner runner;
+	pthread_t scheduler_handle;
+	sem_t semaphore;
+	struct chronosrt_tcb *task_to_run;
+	size_t sleep_for;
+	struct chronosrt_tcb *_Atomic new_threads_list;
+	_Atomic enum chronosrt_timeslice_status timeslice_status;
+};
+
 struct chronosrt {
-	// Lock to ensure mutual exclusion when accessing thread queue
-	pthread_mutex_t lock;
-	// A semaphore scheduler thread waits on. Initially its used for bootstrap (scheduler thread waits for one token,
-	// allowing main thread to finish initialization and submit itself to the scheduler). Later it is used by threads
-	// running on the scheduler to signal completition of their timeslices.
-	sem_t notify_sched_sem;
-	// CPU scheduler thread has been assigned to
-	size_t scheduler_cpu_id;
-	// CPU set for chronosrt-managed threads
-	cpu_set_t *mask;
-	size_t cpusetsize;
-	size_t cpu_alloc_size;
-	// Scratch CPU mask
-	cpu_set_t *scratch_mask;
-	// Pairing heap for scheduled threads
-	pairing_heap_t heap;
-	// vruntime step target
-	size_t vruntime_step;
-	// runtime creation time
-	size_t creation_time;
-};
+	struct chronosrt_cfg cfg;
+	struct chronosrt_cpu *cpus;
+	size_t scheduler_cpu;
+	size_t cpus_count;
+	pairing_heap_t runqueue;
+	chronosrt_spinlock_t runqueue_lock;
+	sem_t scheduler_sem;
+} chronosrt;
 
-// chronosrt thread-local state.
-struct chronosrt_thread_state {
-	// Pairing heap node
-	pairing_heap_node_t node;
-	// thread ID
-	size_t tid;
-	// Semaphore used by the scheduler to pause threads
-	sem_t sched_go_ahead_sem;
-	// Pointer to the runtime
-	struct chronosrt *rt;
-	// Last vruntime
-	size_t vruntime;
-	// Average TDF for the last round
-	size_t average_tdf;
-	// Round start time in ns
-	size_t round_start_ns;
-	// vruntime on round start
-	size_t round_start_vruntime;
-	// Last time vruntime value has been updated
-	size_t last_vruntime_calc_ns;
-	// Current TDF as a percentage
-	size_t tdf;
-	// Deadline (as specified by the scheduler thread)
-	size_t relative_timer_deadline;
-	// Target vruntime at round completition
-	size_t completition_vruntime;
-	// Thread's expiration timer
-	timer_t timer;
-};
-
-static __thread struct chronosrt_thread_state *chronosrt_tcb = NULL;
-
-#define NS_IN_S 1000000000
-
-// Signal vector used by chronosrt for timer interrupts
-#define TIMER_VECTOR SIGALRM
-
-// Convert timespec into nanoseconds
-static size_t chronosrt_timespec_to_nsec(struct timespec const *timespec) {
-	return timespec->tv_sec * NS_IN_S + timespec->tv_nsec;
+static void chronosrt_set_tcb_ptr(struct chronosrt_tcb *tcb) {
+#if defined(__x86_64)
+	CHRONOSRT_ASSERT_FALSE(syscall(SYS_arch_prctl, ARCH_SET_GS, tcb));
+	tcb->self = tcb;
+#else
+#error Unsupported architecture
+#endif
 }
 
-// Convert nanoseconds into timespec
-static size_t chronosrt_nsec_to_timespec(struct timespec *timespec, size_t nsec) {
-	timespec->tv_sec = nsec / NS_IN_S;
-	timespec->tv_nsec = nsec % NS_IN_S;
+inline static struct chronosrt_tcb *chronosrt_get_tcb_ptr() {
+#if defined(__x86_64)
+	__seg_gs struct chronosrt_tcb *tcb_ptr = (__seg_gs void *)0;
+	return tcb_ptr->self;
+#else
+#error Unsupported architecture
+#endif
 }
 
-// Get nanoseconds since epoch
-static size_t chronosrt_nsecs_since_epoch() {
-	struct timespec tp;
-	if (clock_gettime(CLOCK_MONOTONIC, &tp)) {
-		dprintf(2, "libchronosrt: clock_gettime(CLOCK_MONOTONIC) failed\n");
-		abort();
-	}
-	return chronosrt_timespec_to_nsec(&tp);
+void chronosrt_enter_critical(void) {
+	chronosrt_runner_disable_preemption(0);
 }
 
-// Schedule thread to run on a given CPU
-static void chronosrt_send_tid_to_cpu(size_t tid, size_t cpu, cpu_set_t *scratch_mask, size_t cpusetsize,
-                                      size_t cpu_alloc_size) {
-	// Set thread affinity
-	CPU_ZERO_S(cpu_alloc_size, scratch_mask);
-	CPU_SET_S(cpu, cpu_alloc_size, scratch_mask);
-	sched_setaffinity(tid, cpusetsize, scratch_mask);
-	// Set thread priority
-	struct sched_param param;
-	param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-	sched_setscheduler(tid, SCHED_FIFO, &param);
+void chronosrt_exit_critical(void) {
+	chronosrt_runner_enable_preemption(0);
 }
 
-// Runtime cleanup routine
-static void chronosrt_cleanup(struct chronosrt *rt) {
-	CPU_FREE(rt->mask);
-	CPU_FREE(rt->scratch_mask);
-	pthread_mutex_destroy(&rt->lock);
-	sem_destroy(&rt->notify_sched_sem);
-	free(rt);
+static struct chronosrt_tcb *chronosrt_new_thread_token_impl(size_t vruntime, struct chronosrt_cpu *cpu) {
+	struct chronosrt_tcb *tcb = malloc(sizeof(struct chronosrt_tcb));
+	CHRONOSRT_ASSERT_TRUE(tcb);
+	tcb->first_time = true;
+	tcb->running_on_cpu = cpu;
+	chronosrt_vruntime_set_virtual_ts(&tcb->vruntime_info, vruntime);
+	tcb->vruntime_info.tdf = CHRONOSRT_VRUNTIME_TDF_UNIT;
+	return tcb;
 }
 
-// Scheduler thread routine
-static void *chronosrt_scheduler(void *arg) {
-	struct chronosrt *rt = arg;
-	// Claim scheduler CPU
-	chronosrt_send_tid_to_cpu(0, rt->scheduler_cpu_id, rt->scratch_mask, rt->cpusetsize, rt->cpu_alloc_size);
-	// Wait for the init thread to finish initialization
-	sem_wait(&rt->notify_sched_sem);
-	// Record creation time
-	rt->creation_time = chronosrt_nsecs_since_epoch();
-	// Runtime bootstrap done, enter main loop
-	while (true) {
-		// prepare for the new round, lock the runtime instance
-		pthread_mutex_lock(&rt->lock);
-		// if runnable thread queue is empty, drop instance
-		if (!pairing_heap_get_min(&rt->heap)) {
-			pthread_mutex_unlock(&rt->lock);
-			break;
-		}
-		size_t runnable_threads = 0;
-		// pick threads for each CPU
-		bool some_thread_picked = false;
-		size_t vruntime_threshold = 0;
-		for (size_t i = 0; i < rt->cpusetsize; ++i) {
-			if (CPU_ISSET_S(i, rt->cpu_alloc_size, rt->mask)) {
-				// pick thread with lowest vruntime from the queue
-				pairing_heap_node_t *node = pairing_heap_get_min(&rt->heap);
-				if (node == NULL) {
-					break;
-				}
-				struct chronosrt_thread_state *tcb = (struct chronosrt_thread_state *)node;
-				if (!some_thread_picked) {
-					some_thread_picked = true;
-					vruntime_threshold = tcb->vruntime + (size_t)((double)rt->vruntime_step * MAX_VRUNTIME_DIFF_FACTOR);
-				}
-				// check that thread vruntime is within appropriate bounds
-				if (tcb->vruntime > vruntime_threshold) {
-					break;
-				}
-				// delete thread from the runqueue
-				pairing_heap_del_min(&rt->heap);
-				// calculate how long thread should run for
-				tcb->relative_timer_deadline = (rt->vruntime_step * tcb->average_tdf) / TDF_UNIT;
-				// start the thread
-				chronosrt_send_tid_to_cpu(tcb->tid, rt->scheduler_cpu_id, rt->scratch_mask, rt->cpusetsize,
-				                          rt->cpu_alloc_size);
-				sem_post(&tcb->sched_go_ahead_sem);
-				runnable_threads++;
-			}
-		}
-		// unlock the runtime instance
-		pthread_mutex_unlock(&rt->lock);
-		// wait for the round to finish
-		for (size_t i = 0; i < runnable_threads; ++i) {
-			sem_wait(&rt->notify_sched_sem);
-		}
-	}
-	// Cleanup current instance
-	chronosrt_cleanup(rt);
-	return NULL;
+void *chronosrt_new_thread_token() {
+	struct chronosrt_tcb *my_tcb = chronosrt_get_tcb_ptr();
+	size_t spawn_vruntime = chronosrt_vruntime_get(&my_tcb->vruntime_info);
+	return chronosrt_new_thread_token_impl(spawn_vruntime, my_tcb->running_on_cpu);
 }
 
-// Set timer to fire at a given nanosecond count
-static void chronosrt_schedule_timer_in(size_t nsec) {
-	struct itimerspec its;
-	chronosrt_nsec_to_timespec(&its.it_value, nsec);
-	its.it_interval.tv_nsec = 0;
-	its.it_interval.tv_sec = 0;
-	if (timer_settime(chronosrt_tcb->timer, 0, &its, NULL)) {
-		dprintf(2, "libchronosrt: timer_settime failed\n");
-		abort();
-	}
+static void chronosrt_complete_tcb_init(struct chronosrt_tcb *tcb) {
+	tcb->tid = gettid();
+	chronosrt_set_tcb_ptr(tcb);
 }
 
-// Disarm timer
-static void chronosrt_disarm_timer() {
-	struct itimerspec its;
-	its.it_value.tv_nsec = 0;
-	its.it_value.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
-	its.it_interval.tv_sec = 0;
-	if (timer_settime(chronosrt_tcb->timer, 0, &its, NULL)) {
-		dprintf(2, "libchronosrt: timer_settime failed\n");
-		abort();
-	}
+void chronosrt_attach(void *token) {
+	struct chronosrt_tcb *my_tcb = token;
+	chronosrt_complete_tcb_init(my_tcb);
+
+	chronosrt_runner_disable_preemption(0);
+	struct chronosrt_cpu *cpu = my_tcb->running_on_cpu;
+
+	// Enqueue new task into new threads queue
+	my_tcb->next_new_thread = atomic_load_explicit(&cpu->new_threads_list, memory_order_relaxed);
+	atomic_store_explicit(&cpu->new_threads_list, my_tcb, memory_order_relaxed);
+	chronosrt_runner_freeze(0); // Scheduling equivalent of suicide
 }
 
-// Recalculate vruntime field
-void chronosrt_update_runtimes() {
-	// Calculate delta in nanoseconds
-	size_t old_nsec = chronosrt_tcb->last_vruntime_calc_ns;
-	size_t new_nsec = chronosrt_nsecs_since_epoch();
-	size_t delta = new_nsec - old_nsec;
-	// Update vruntime
-	size_t scaled_delta = (delta * TDF_UNIT) / chronosrt_tcb->tdf;
-	chronosrt_tcb->vruntime += scaled_delta;
-	chronosrt_tcb->last_vruntime_calc_ns = new_nsec;
+void chronosrt_detach(void) {
+	chronosrt_runner_disable_preemption(0);
+	// Tell per-cpu scheduler that we shouldn't be enqueued again
+	struct chronosrt_tcb *my_tcb = chronosrt_get_tcb_ptr();
+	CHRONOSRT_LOG("thread %p called chronosrt_detach()", my_tcb);
+	atomic_store_explicit(&my_tcb->running_on_cpu->timeslice_status, CHRONOSRT_DETACH, memory_order_relaxed);
+	chronosrt_runner_enable_preemption(0);
 }
 
-// Enqueue current thread into runnable queue
-static void chronosrt_enqueue_runnable() {
-	struct chronosrt *rt = chronosrt_tcb->rt;
-	pairing_heap_node_t *node = &chronosrt_tcb->node;
-	pthread_mutex_lock(&rt->lock);
-	node->key = chronosrt_tcb->vruntime;
-	pairing_heap_insert(&rt->heap, node);
-	pthread_mutex_unlock(&rt->lock);
+static void chronosrt_rq_insert(struct chronosrt_tcb *tcb) {
+	tcb->queue_node.key = chronosrt_vruntime_get(&tcb->vruntime_info);
+	pairing_heap_insert(&chronosrt.runqueue, &tcb->queue_node);
 }
 
-// Wait for the scheduler to signal that our thread is now runnable
-static void chronosrt_wait_from_ack_from_sched() {
-	sem_wait(&chronosrt_tcb->sched_go_ahead_sem);
-	// Start of a new timeslice.
-	chronosrt_schedule_timer_in(chronosrt_tcb->relative_timer_deadline);
-	chronosrt_tcb->round_start_ns = chronosrt_nsecs_since_epoch();
-	chronosrt_tcb->last_vruntime_calc_ns = chronosrt_tcb->round_start_ns;
-	chronosrt_tcb->round_start_vruntime = chronosrt_tcb->vruntime;
-}
-
-// Tell scheduler this thread is done with a timeslice
-static void chronosrt_signal_this_timeslice_done() {
-	sem_post(&chronosrt_tcb->rt->notify_sched_sem);
-}
-
-// Preemption handler
-static void chronosrt_on_round_end() {
-	chronosrt_update_runtimes();
-	// Calculate average TDF for the scheduler
-	size_t ns_delta = chronosrt_nsecs_since_epoch() - chronosrt_tcb->round_start_ns;
-	size_t vruntime_delta = chronosrt_tcb->vruntime - chronosrt_tcb->round_start_vruntime;
-	chronosrt_tcb->average_tdf = (TDF_UNIT * ns_delta) / vruntime_delta;
-	// Enqueue current thread
-	chronosrt_enqueue_runnable();
-	// Tell scheduler we have finished our timeslice
-	chronosrt_signal_this_timeslice_done();
-	// Wait till scheduler gives us another timeslice
-	chronosrt_wait_from_ack_from_sched();
-}
-
-static __thread volatile sig_atomic_t chronosrt_disable_preemption = 0;
-static __thread volatile sig_atomic_t chronosrt_preemption_pending = 0;
-
-// Signal preemtion
-static void chronosrt_signal_preemption() {
-	if (chronosrt_preemption_pending) {
-		return;
-	} else if (chronosrt_disable_preemption) {
-		chronosrt_preemption_pending = 1;
-	} else {
-		chronosrt_on_round_end();
-	}
-}
-
-// Enter critical section (disable rescheduling). Returns critical section id that is to be passed to
-// chronosrt_exit_critical
-int chronosrt_enter_critical() {
-	if (chronosrt_disable_preemption) {
-		return 1;
-	}
-	chronosrt_disable_preemption = 1;
-	return 0;
-}
-
-// Exit critical section (enable rescheduling). Accepts critical section id from chronosrt_enter_critical
-static void chronosrt_exit_critical_impl(int section_id) {
-	assert(chronosrt_disable_preemption);
-	if (section_id == 1) {
-		return;
-	}
-	chronosrt_disable_preemption = 0;
-	if (chronosrt_preemption_pending) {
-		// Timer interrupt arrived while we were in critical section
-		// Run deferred preemption routine now
-		chronosrt_preemption_pending = 0;
-		chronosrt_on_round_end();
-	}
-}
-
-// Do vruntime check and see if its time to preempt. Run with preemption disabled
-static void chronosrt_vruntime_check_impl() {
-	assert(chronosrt_disable_preemption);
-	if (chronosrt_tcb->vruntime > chronosrt_tcb->completition_vruntime) {
-		// stop timer. We don't have to per se, but why not
-		chronosrt_disarm_timer();
-		// this will have effect as soon as we exit the outermost critical section
-		chronosrt_signal_preemption();
-	}
-}
-
-// Public exit critical section function. Checks vruntime
-void chronosrt_exit_critical(int section_id) {
-	chronosrt_update_runtimes();
-	chronosrt_vruntime_check_impl();
-	chronosrt_exit_critical_impl(section_id);
-}
-
-// Check that vruntime is wtihin bounds and preempt if necessary. Won't have effect until outermost critical section is
-// exited.
-void chronosrt_vruntime_check() {
-	if (chronosrt_disable_preemption) {
-		// chronosrt_exit_criticial will do the check
-		return;
-	}
-	// Vruntime check requires that we run inside a critical section
-	// chronosrt_exit_critical() does a vruntime check on its own
-	// Hence entering critical section and exitiing it immediatelly does the trick
-	chronosrt_exit_critical(chronosrt_enter_critical());
-}
-
-// Set up timer
-static void chronosrt_set_up_timer() {
-	// Set up SIGALRM singal handler
-	sigset_t mask;
-	struct sigaction sa;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-	sa.sa_handler = &chronosrt_signal_preemption;
-	if (sigaction(TIMER_VECTOR, &sa, NULL)) {
-		dprintf(2, "libchronosrt: sigaction failed\n");
-		abort();
-	}
-	// Set up timer
-	struct sigevent sev;
-	sev.sigev_notify = SIGEV_THREAD_ID;
-	sev.sigev_signo = TIMER_VECTOR;
-	sev._sigev_un._tid = gettid();
-	if (timer_create(CLOCK_MONOTONIC, &sev, &chronosrt_tcb->timer)) {
-		dprintf(2, "libchronosrt: timer_create failed: %s\n", strerror(errno));
-		abort();
-	}
-}
-
-static void chronosrt_submit_nowait(void *rt_token, size_t initial_vruntime) {
-	struct chronosrt *rt = rt_token;
-	// Allocate chronosrt TCB
-	struct chronosrt_thread_state *state = malloc(sizeof(struct chronosrt_thread_state));
-	if (state == NULL) {
-		dprintf(2, "libchronosrt: malloc failed\n");
-		abort();
-	}
-	chronosrt_tcb = state;
-	if (sem_init(&chronosrt_tcb->sched_go_ahead_sem, 0, 0)) {
-		dprintf(2, "libchronosrt: sem_init failed\n");
-		abort();
-	}
-	chronosrt_tcb->tid = gettid();
-	chronosrt_tcb->rt = rt;
-	chronosrt_tcb->vruntime = initial_vruntime;
-	chronosrt_tcb->tdf = TDF_UNIT;
-	chronosrt_tcb->average_tdf = TDF_UNIT;
-	chronosrt_set_up_timer();
-	// Tell scheduler we are now runnable
-	chronosrt_enqueue_runnable();
-}
-
-void *chronosrt_init(size_t cpusetsize, cpu_set_t const *mask, size_t vruntime_step) {
-	// Allocate memory for chronosrt runtime
-	struct chronosrt *rt = malloc(sizeof(struct chronosrt));
-	if (rt == NULL) {
+static struct chronosrt_tcb *chronosrt_rq_get_min() {
+	struct pairing_heap_node *res = pairing_heap_get_min(&chronosrt.runqueue);
+	if (res == NULL) {
 		return NULL;
 	}
-	rt->vruntime_step = vruntime_step;
-	// Initialize runtime mutex
-	if (pthread_mutex_init(&rt->lock, NULL)) {
-		goto free_rt;
+	return (struct chronosrt_tcb *)((uintptr_t)res - offsetof(struct chronosrt_tcb, queue_node));
+}
+
+static struct chronosrt_tcb *chronosrt_rq_del_min() {
+	struct pairing_heap_node *res = pairing_heap_del_min(&chronosrt.runqueue);
+	if (res == NULL) {
+		return NULL;
 	}
-	// Initialize scheduler thread notification semaphore
-	if (sem_init(&rt->notify_sched_sem, 0, 0)) {
-		goto destroy_mutex;
-	}
-	// Go over CPUs and allocate one CPU to the scheduler thread
-	// Copy CPU mask in the process
-	rt->mask = CPU_ALLOC(cpusetsize);
-	rt->scratch_mask = CPU_ALLOC(cpusetsize);
-	if (rt->mask == NULL || rt->scratch_mask == NULL) {
-		goto destroy_sem;
-	}
-	rt->cpusetsize = cpusetsize;
-	rt->cpu_alloc_size = CPU_ALLOC_SIZE(cpusetsize);
-	CPU_ZERO_S(rt->cpu_alloc_size, rt->mask);
-	bool scheduler_got_a_cpu = false;
-	for (size_t i = 0; i < cpusetsize; ++i) {
-		if (!CPU_ISSET_S(i, rt->cpu_alloc_size, mask)) {
-			continue;
-		} else if (!scheduler_got_a_cpu) {
-			// Allocate CPU i to the scheduler
-			rt->scheduler_cpu_id = i;
-			scheduler_got_a_cpu = true;
-		} else {
-			CPU_SET_S(i, rt->cpu_alloc_size, rt->mask);
+	return (struct chronosrt_tcb *)((uintptr_t)res - offsetof(struct chronosrt_tcb, queue_node));
+}
+
+// A really dumb scheduling algorithm
+// TODO: rewrite this, this is just awful
+static size_t chronosrt_map_tasks(struct chronosrt_cpu *sched_cpu) {
+	(void)sched_cpu;
+	size_t waiting_for = 0;
+	bool picked_one_task = false;
+	size_t min_vruntime = 0;
+
+	for (size_t i = 0; i < chronosrt.cpus_count; ++i) {
+		struct chronosrt_tcb *next = chronosrt_rq_get_min();
+
+		if (picked_one_task && next->queue_node.key - min_vruntime > chronosrt.cfg.max_vruntime_diff) {
+			break;
+		} else if (!picked_one_task) {
+			picked_one_task = true;
+			min_vruntime = next->queue_node.key;
 		}
+		chronosrt_rq_del_min();
+
+		waiting_for++;
+		chronosrt.cpus[i].task_to_run = next;
+		chronosrt.cpus[i].sleep_for = chronosrt.cfg.ns_min_timeslice;
+
+		CHRONOSRT_LOG("scheduler: assigning task %p to CPU %zu (vruntime: %zu, real time timeslice length: %zu).", next,
+		              i, next->queue_node.key, chronosrt.cpus[i].sleep_for);
+		sem_post(&chronosrt.cpus[i].semaphore);
 	}
-	if (!scheduler_got_a_cpu) {
-		goto free_mask;
+
+	return waiting_for;
+}
+
+static void *chronosrt_scheduler_for_cpu(void *cpu_arg) {
+	struct chronosrt_cpu *cpu = cpu_arg;
+
+	// Prevent signals from being handled on this thread
+	chronosrt_disable_signals();
+
+	bool scheduler = chronosrt.cpus + 0 == cpu;
+
+	// Number of cores scheduler is waiting on to finish timeslices
+	// NOTE: we set this to 1 on startup so that init thread can signal the scheduler its done with initialization
+	size_t waiting_for = 1;
+
+	for (;;) {
+		if (scheduler) {
+			// Wait for the last round to finish
+			CHRONOSRT_LOG("scheduler: waiting for the round to finish...");
+			for (size_t i = 0; i < waiting_for; ++i) {
+				sem_wait(&chronosrt.scheduler_sem);
+			}
+			// Map tasks to CPUs
+			CHRONOSRT_LOG("scheduler: round done, mapping tasks to CPU...");
+			waiting_for = chronosrt_map_tasks(cpu);
+		}
+
+		// Wait for the scheduler to assign us a task
+		sem_wait(&cpu->semaphore);
+
+		CHRONOSRT_LOG("CPU %zu got a task to run (%p)", cpu - chronosrt.cpus, cpu->task_to_run);
+
+		// Let the task run
+		chronosrt_vruntime_set_real_ts(&cpu->task_to_run->vruntime_info, chronosrt_ns_from_boot());
+		atomic_store_explicit(&cpu->timeslice_status, CHRONOSRT_AGAIN, memory_order_relaxed);
+		chronosrt_runner_make_runnable_on(cpu->task_to_run->tid, &cpu->runner);
+
+		// Wait for the expiration of the timeslice
+		CHRONOSRT_LOG("CPU %zu about to enter nanosleep for %zu nanoseconds", cpu - chronosrt.cpus, cpu->sleep_for);
+		chronosrt_sleep(cpu->sleep_for);
+
+		// Check if thread has detached
+		enum chronosrt_timeslice_status status = atomic_load_explicit(&cpu->timeslice_status, memory_order_relaxed);
+		if (status == CHRONOSRT_AGAIN) {
+			cpu->task_to_run->first_time = false;
+			// Pause the thread
+			chronosrt_runner_freeze(cpu->task_to_run->tid);
+			// Update thread's vruntime
+			chronosrt_vruntime_update(&cpu->task_to_run->vruntime_info);
+			CHRONOSRT_LOG("Task on CPU %zu completed timeslice with CHRONOSRT_AGAIN status", cpu - chronosrt.cpus);
+		} else {
+			CHRONOSRT_LOG("Task on CPU %zu completed timeslice with CHRONOSRT_DETACH status", cpu - chronosrt.cpus);
+		}
+
+		{
+			size_t ticket = chronosrt_spinlock(chronosrt.runqueue_lock);
+			CHRONOSRT_LOG("CPU %zu acquired runqueue lock", cpu - chronosrt.cpus);
+
+			// Enqueue new threads
+			struct chronosrt_tcb *head = cpu->new_threads_list;
+			while (head != NULL) {
+				chronosrt_rq_insert(head);
+				head = head->next_new_thread;
+			}
+			cpu->new_threads_list = NULL;
+
+			// Enqueue current task
+			if (status == CHRONOSRT_AGAIN) {
+				chronosrt_rq_insert(cpu->task_to_run);
+			}
+
+			CHRONOSRT_LOG("CPU %zu is about to release runqueue lock", cpu - chronosrt.cpus);
+			chronosrt_spinunlock(chronosrt.runqueue_lock, ticket);
+		}
+
+		// Tell the scheduler this timeslice is done
+		sem_post(&chronosrt.scheduler_sem);
 	}
-	// Start scheduler thread
-	pthread_t scheduler_thread;
-	if (pthread_create(&scheduler_thread, NULL, chronosrt_scheduler, rt)) {
-		goto free_mask;
-	}
-	if (pthread_detach(scheduler_thread)) {
-		goto free_mask;
-	}
-	// Submit to the scheduler
-	chronosrt_submit_nowait(rt, 0);
-	// Signal the scheduler that we are now runnable
-	sem_post(&rt->notify_sched_sem);
-	// Wait until scheduler gives a timeslice
-	chronosrt_wait_from_ack_from_sched();
-	return rt;
-free_mask:
-	if (rt->mask != NULL) {
-		CPU_FREE(rt->mask);
-	}
-	if (rt->scratch_mask != NULL) {
-		CPU_FREE(rt->mask);
-	}
-destroy_mutex:
-	pthread_mutex_destroy(&rt->lock);
-destroy_sem:
-	sem_destroy(&rt->notify_sched_sem);
-free_rt:
-	free(rt);
 	return NULL;
 }
 
-void chronosrt_submit(void *rt_token, size_t initial_vruntime) {
-	chronosrt_submit_nowait(rt_token, initial_vruntime);
-	// Wait until scheduler gives us another timeslice
-	chronosrt_wait_from_ack_from_sched();
+void chronosrt_instantiate_runtime(struct chronosrt_cfg *cfg) {
+	// Copy config over and init nofication semaphore
+	chronosrt.cfg = *cfg;
+	chronosrt_sched_policy_init(cfg);
+	CHRONOSRT_ASSERT_FALSE(sem_init(&chronosrt.scheduler_sem, 0, 0));
+
+	// Pick CPU to run barrier and scheduler on
+	chronosrt.scheduler_cpu = chronosrt_cpuset_first_set(cfg->cpuset);
+	if (chronosrt.scheduler_cpu == chronosrt_cpuset_size(cfg->cpuset)) {
+		// No CPU set
+		chronosrt_fail("No CPU specified in the bitmask");
+	}
+	// Spawn suspension barrier
+	chronosrt_runner_freezer_init(chronosrt.scheduler_cpu);
+
+	// Allocate per-cpu storage
+	size_t cpus_count = chronosrt_cpuset_count(cfg->cpuset);
+	chronosrt.cpus = malloc(sizeof(struct chronosrt_cpu) * cpus_count);
+	chronosrt.cpus_count = cpus_count;
+	CHRONOSRT_ASSERT_TRUE(chronosrt.cpus);
+
+	chronosrt.runqueue_lock = chronosrt_new_spinlock(cpus_count);
+
+	// Scheduler threads we spawn can preempt us otherwise and we wouldn't get a chance to run
+	chronosrt_runner_disable_preemption(0);
+
+	// Spawn per-cpu scheduler threads
+	size_t cpusetsize = chronosrt_cpuset_size(cfg->cpuset);
+	size_t cpus_idx = 0;
+	for (size_t i = 0; i < cpusetsize; ++i) {
+		if (!chronosrt_cpuset_get(cfg->cpuset, i)) {
+			continue;
+		}
+		struct chronosrt_cpu *cpu = chronosrt.cpus + cpus_idx++;
+		CHRONOSRT_ASSERT_FALSE(sem_init(&cpu->semaphore, 0, 0));
+
+		// Spawn a scheduler thread on this CPU
+		chronosrt_runner_init(&cpu->runner, i);
+		CHRONOSRT_ASSERT_FALSE(pthread_create(&cpu->scheduler_handle, NULL, chronosrt_scheduler_for_cpu, cpu));
+		CHRONOSRT_ASSERT_FALSE(pthread_detach(cpu->scheduler_handle));
+		chronosrt_runner_make_scheduler_on_p(cpu->scheduler_handle, &cpu->runner);
+	}
+
+	// Switch to the CPU global scheduler runs on
+	chronosrt_runner_make_scheduler_on(0, &chronosrt.cpus[0].runner);
+
+	// Submit this thread to the scheduler
+	struct chronosrt_tcb *token = chronosrt_new_thread_token_impl(0, chronosrt.cpus + 0);
+	chronosrt_complete_tcb_init(token);
+	chronosrt_rq_insert(token);
+	sem_post(&chronosrt.scheduler_sem);
+	CHRONOSRT_LOG("init thread about to enter sched_yield()");
+	sched_yield(); // yield to the scheduler that will degrade us to runnable priority
+	CHRONOSRT_LOG("init thread exited sched_yield()");
 }
 
-void chronosrt_detatch() {
-	// Delete timer, we won't need it anymore
-	timer_delete(chronosrt_tcb->timer);
-	// TODO: switch to a different CPU
-	// Tell scheduler we have finished running this timeslice. We have not enqueued this thread into runqueue, so
-	// this thread is not coming back
-	chronosrt_signal_this_timeslice_done();
-	// And we are done... Scheduler thread does not know we exist anymore
-	sem_destroy(&chronosrt_tcb->sched_go_ahead_sem);
-	free(chronosrt_tcb);
-	chronosrt_tcb = NULL;
+void chronosrt_set_tdf(double new_tdf) {
+	struct chronosrt_tcb *tcb = chronosrt_get_tcb_ptr();
+	chronosrt_vruntime_update(&tcb->vruntime_info);
+	chronosrt_vruntime_set_tdf(&tcb->vruntime_info, new_tdf);
 }
 
-void chronosrt_set_tdf(double tdf) {
-	size_t tdf_as_int = (size_t)((double)TDF_UNIT * tdf);
-	chronosrt_update_runtimes();
-	chronosrt_tcb->tdf = tdf_as_int;
-}
-
-void chronosrt_jump(size_t delta_ns) {
-	chronosrt_tcb->vruntime += delta_ns;
-	chronosrt_vruntime_check();
-}
-
-size_t chronosrt_get_vruntime() {
-	chronosrt_update_runtimes();
-	return chronosrt_tcb->vruntime;
-}
-
-size_t chronosrt_get_realtime() {
-	return chronosrt_nsecs_since_epoch() - chronosrt_tcb->rt->creation_time;
+size_t chronosrt_get_virtual_time(void) {
+	struct chronosrt_tcb *tcb = chronosrt_get_tcb_ptr();
+	chronosrt_vruntime_update(&tcb->vruntime_info);
+	return chronosrt_vruntime_get(&tcb->vruntime_info);
 }

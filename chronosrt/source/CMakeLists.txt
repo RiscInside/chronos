@@ -1,3 +1,12 @@
 cmake_minimum_required(VERSION 3.13)
 
+target_include_directories(${CHRONOSRT_TARGET} PRIVATE .)
 target_sources(${CHRONOSRT_TARGET} PRIVATE chronosrt.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE cpuset.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE fail.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE nosignals.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE ns.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE runner.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE schedpolicy.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE spinlock.c)
+target_sources(${CHRONOSRT_TARGET} PRIVATE vruntime.c)

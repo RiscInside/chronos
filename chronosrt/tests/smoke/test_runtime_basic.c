@@ -1,23 +1,16 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include <chronosrt.h>
-#include <stdio.h>
-
-#include "timeline.h"
+#include <chronosrt/chronosrt.h>
+#include <chronosrt/cpuset.h>
+#include <timeline.h>
 
 int main() {
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	CPU_SET(0, &set);
-	CPU_SET(1, &set);
+	struct chronosrt_cfg cfg;
+	cfg.cpuset = chronosrt_cpuset_create_with_one_set(0); // only give one cpu
+	cfg.max_vruntime_diff = 500000000;                    // allow for max 100 milliseconds mismatch
+	cfg.ns_min_timeslice = 500000000;                     // reschedule every 100 milliseconds
 
-	chronosrt_init(2, &set, 1000000);
-	printf("runtime up\n");
+	chronosrt_instantiate_runtime(&cfg);
 
-	timeline_spin_for(1000);
+	timeline_spin_for(10000);
 
-	chronosrt_detatch();
-	printf("runtime down\n");
+	chronosrt_detach();
 }
