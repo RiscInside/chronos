@@ -24,3 +24,8 @@ noreturn void chronosrt_fail(const char *fmt, ...);
 	} while (0)
 
 #endif
+
+#define CHRONOSRT_UNREACHABLE()                                                                                        \
+	do {                                                                                                               \
+		chronosrt_fail("CHRONOSRT_UNREACHABLE reached at %s:%d", __FILE__, __LINE__);                                  \
+	} while (0)

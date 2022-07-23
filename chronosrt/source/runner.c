@@ -53,20 +53,38 @@ void chronosrt_runner_init(struct chronosrt_runner *runner, size_t cpu) {
 	runner->cpuset = chronosrt_cpuset_create_with_one_set(cpu);
 }
 
-void chronosrt_runner_schedule_on(pid_t tid, struct chronosrt_runner *runner) {
-	chronosrt_set_affinity(tid, runner->cpuset);
-	chronosrt_sched_policy_set_runnable(tid);
-}
-
-void chronosrt_runner_schedule_on_p(pthread_t thread, struct chronosrt_runner *runner) {
-	chronosrt_set_affinity_p(thread, runner->cpuset);
-	chronosrt_sched_policy_set_runnable_p(thread);
-}
-
 void chronosrt_runner_disable_preemption(pid_t tid) {
 	chronosrt_sched_policy_set_scheduler(tid);
 }
 
 void chronosrt_runner_disable_preemption_p(pthread_t thread) {
 	chronosrt_sched_policy_set_scheduler_p(thread);
+}
+
+void chronosrt_runner_enable_preemption(pid_t tid) {
+	chronosrt_sched_policy_set_runnable(tid);
+}
+
+void chronosrt_runner_enable_preemption_p(pthread_t thread) {
+	chronosrt_sched_policy_set_runnable_p(thread);
+}
+
+void chronosrt_runner_make_runnable_on(pid_t tid, struct chronosrt_runner *runner) {
+	chronosrt_set_affinity(tid, runner->cpuset);
+	chronosrt_runner_enable_preemption(tid);
+}
+
+void chronosrt_runner_make_runnable_on_p(pthread_t thread, struct chronosrt_runner *runner) {
+	chronosrt_set_affinity_p(thread, runner->cpuset);
+	chronosrt_runner_enable_preemption_p(thread);
+}
+
+void chronosrt_runner_make_scheduler_on(pid_t tid, struct chronosrt_runner *runner) {
+	chronosrt_set_affinity(tid, runner->cpuset);
+	chronosrt_runner_disable_preemption(tid);
+}
+
+void chronosrt_runner_make_scheduler_on_p(pthread_t thread, struct chronosrt_runner *runner) {
+	chronosrt_set_affinity_p(thread, runner->cpuset);
+	chronosrt_runner_disable_preemption_p(thread);
 }

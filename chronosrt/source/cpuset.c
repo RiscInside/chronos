@@ -26,6 +26,18 @@ chronosrt_cpuset_t *chronosrt_cpuset_create(size_t cpus) {
 	return cpuset;
 }
 
+void chronosrt_cpuset_copy(chronosrt_cpuset_t *src, chronosrt_cpuset_t *dst) {
+	for (size_t i = 0; i < dst->cpus; ++i) {
+		chronosrt_cpuset_set(dst, i, chronosrt_cpuset_get(src, i));
+	}
+}
+
+chronosrt_cpuset_t *chronosrt_cpuset_create_copy(chronosrt_cpuset_t *other) {
+	chronosrt_cpuset_t *cpuset = chronosrt_cpuset_create(other->cpus);
+	chronosrt_cpuset_copy(cpuset, other);
+	return cpuset;
+}
+
 chronosrt_cpuset_t *chronosrt_cpuset_create_with_one_set(size_t cpu) {
 	struct chronosrt_cpuset_struct *cpuset = chronosrt_cpuset_create(cpu + 1);
 	chronosrt_cpuset_set(cpuset, cpu, 1);
@@ -63,14 +75,25 @@ void chronosrt_set_affinity_p(pthread_t thread, chronosrt_cpuset_t *set) {
 	CHRONOSRT_ASSERT_FALSE(pthread_setaffinity_np(thread, set->cpu_alloc_size, set->cpuset));
 }
 
-size_t chronos_cpuset_size(chronosrt_cpuset_t *set) {
+size_t chronosrt_cpuset_size(chronosrt_cpuset_t *set) {
 	return set->cpus;
 }
 
-chronosrt_cpuset_t *chronosrt_cpuset_copy(chronosrt_cpuset_t *other) {
-	struct chronosrt_cpuset_struct *cpuset = chronosrt_cpuset_create(other->cpus);
-	for (size_t i = 0; i < cpuset->cpus; ++i) {
-		chronosrt_cpuset_set(cpuset, i, chronosrt_cpuset_get(other, i));
+size_t chronosrt_cpuset_count(chronosrt_cpuset_t *set) {
+	size_t res = 0;
+	for (size_t i = 0; i < set->cpus; ++i) {
+		if (chronosrt_cpuset_get(set, i)) {
+			res++;
+		}
 	}
-	return cpuset;
+	return res;
+}
+
+size_t chronosrt_cpuset_first_set(chronosrt_cpuset_t *set) {
+	for (size_t i = 0; i < set->cpus; ++i) {
+		if (chronosrt_cpuset_get(set, i)) {
+			return i;
+		}
+	}
+	return set->cpus;
 }
