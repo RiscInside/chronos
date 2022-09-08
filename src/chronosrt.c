@@ -934,6 +934,7 @@ void *chronosrt_on_exit_thread(void) {
 void chronosrt_yield(void) {
 	if (cfg.runtime_mode == NOP) {
 		sched_yield(); // Linux scheduler will do it for us
+		return;
 	}
 	struct chronosrt_tcb *my_tcb = chronosrt_get_tcb_ptr();
 	chronosrt_do_local_call(my_tcb, YIELD_PENDING);
