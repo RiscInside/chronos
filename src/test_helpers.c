@@ -249,7 +249,9 @@ void chronos_test_init_runtime(int *argc_out, char **argv) {
 	}
 
 	// Instantiate runtime with given options
-	chronosrt_instantiate(&cfg);
+	void *main_tcb = malloc(chronosrt_tcb_size);
+	chronos_assert(main_tcb);
+	chronosrt_instantiate(&cfg, main_tcb);
 	*argc_out = new_argc;
 }
 

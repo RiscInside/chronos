@@ -39,5 +39,5 @@ int main(int argc, char **argv) {
 	avg_loop_time = chronosrt_calc_avg_loop_duration();
 	chronos_test_log("On average, it now takes %zu nanoseconds for the main scheduler loop to complete", avg_loop_time);
 
-	chronosrt_on_exit_thread();
+	free(chronosrt_on_exit_thread());
 }

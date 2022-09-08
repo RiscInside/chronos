@@ -94,6 +94,9 @@ struct chronosrt_vcpu {
 	bool frozen;
 };
 
+// TCB size
+const size_t chronosrt_tcb_size = sizeof(struct chronosrt_tcb);
+
 // Copy of the config
 static struct chronosrt_config cfg;
 
@@ -200,6 +203,11 @@ inline static struct chronosrt_tcb *chronosrt_get_tcb_ptr() {
 #endif
 }
 
+// Public API wrapper for chronosrt_get_tcb_ptr() that does not expose TCB type
+void *chronosrt_get_tcb(void) {
+	return chronosrt_get_tcb_ptr();
+}
+
 ////// Thread's creation //////
 
 // Pick vCPU for the new task
@@ -227,14 +235,14 @@ static void chronosrt_wait_for_normal(struct chronosrt_tcb *tcb) {
 	}
 }
 
-// Create new TCB
-void *chronosrt_new_tcb() {
+// Initialize a thread control block (usually called before clone() or pthread_create()) in place
+// NOTE: memory from backing_memory to backing_memory + chronosrt_tcb_size is claimed by the runtime
+void *chronosrt_init_new_tcb(void *backing_memory) {
+	chronos_assert(backing_memory);
 	if (cfg.runtime_mode == NOP) {
 		return NULL; // Don't care
 	}
-	// TODO: don't use malloc, use mmap
-	struct chronosrt_tcb *tcb = malloc(sizeof(struct chronosrt_tcb));
-	chronos_assert(tcb);
+	struct chronosrt_tcb *tcb = backing_memory;
 	tcb->self = tcb;
 	tcb->vcpu = chronosrt_best_vcpu();
 	tcb->yield_vruntime_diff = 0;
@@ -701,7 +709,7 @@ static void chronosrt_do_barrier_thread_spawn(void) {
 	barrier_pthread = chronosrt_spawn_on_scheduler_core((void *)chronosrt_barrier_thread_routine, NULL);
 }
 
-void chronosrt_instantiate(struct chronosrt_config *config) {
+void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backing_memory) {
 	// Step 0: Copy config over
 	cfg = *config;
 	// Step 1: Bump real-time rlimit for this process
@@ -757,7 +765,8 @@ void chronosrt_instantiate(struct chronosrt_config *config) {
 		vcpus[i].frozen = false;
 	}
 	// Step 6: Create and register main's thread TCB
-	struct chronosrt_tcb *main_tcb = chronosrt_new_tcb();
+	chronos_assert(main_tcb_backing_memory);
+	struct chronosrt_tcb *main_tcb = chronosrt_init_new_tcb(main_tcb_backing_memory);
 	size_t ns = chronos_ns_get_monotonic();
 	chronos_vruntime_init(&main_tcb->vruntime, ns, cfg.barriers_deadline, 0);
 	main_tcb->vruntime_snapshot = 0;
@@ -912,13 +921,13 @@ size_t chronosrt_get_sim_time(void) {
 }
 
 // To be called on thread exit. See chronos/chronosrt.h
-void chronosrt_on_exit_thread(void) {
+void *chronosrt_on_exit_thread(void) {
 	if (cfg.runtime_mode == NOP) {
-		return; // Who asked?
+		return NULL; // Who asked?
 	}
 	struct chronosrt_tcb *my_tcb = chronosrt_get_tcb_ptr();
 	chronosrt_do_local_call(my_tcb, EXIT_THREAD_PENDING);
-	free(my_tcb); // TODO: do not use malloc()/free() for TCBs
+	return my_tcb;
 }
 
 // Replacement for sched_yield(). See chronos/chronosrt.h

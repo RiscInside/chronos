@@ -56,7 +56,7 @@ void *other_thread(void *tcb) {
 	thread_do_work();
 
 	// Exit this thread
-	chronosrt_on_exit_thread();
+	free(chronosrt_on_exit_thread());
 	return NULL;
 }
 
@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
 	struct chronosrt_timed_section sect;
 	chronosrt_begin_timed_section(0, &sect);
 	for (size_t i = 1; i < THREADS_COUNT; ++i) {
-		void *new_thread_tcb = chronosrt_new_tcb();
+		void *new_thread_tcb = chronosrt_init_new_tcb(malloc(chronosrt_tcb_size));
 		pthread_t pthread;
 		chronos_assert_false(pthread_create(&pthread, NULL, other_thread, new_thread_tcb));
 		chronos_assert_false(pthread_detach(pthread));
@@ -86,5 +86,6 @@ int main(int argc, char **argv) {
 	}
 
 	// Exit this thread
+	free(chronosrt_on_exit_thread());
 	return 0;
 }

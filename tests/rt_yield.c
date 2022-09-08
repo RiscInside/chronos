@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
 	chronos_test_init_runtime(&argc, argv);
 
 	// Spawn a new thread
-	void *new_thread_tcb = chronosrt_new_tcb();
+	void *new_thread_tcb = chronosrt_init_new_tcb(malloc(chronosrt_tcb_size));
 	pthread_t pthread;
 	chronos_assert_false(pthread_create(&pthread, NULL, other_thread, new_thread_tcb));
 	chronos_assert_false(pthread_detach(pthread));
@@ -31,4 +31,6 @@ int main(int argc, char **argv) {
 	// What is our simulation time?
 	size_t sim_time = chronosrt_get_sim_time();
 	chronos_test_log("Simulation time after %zu ns under framework is %zu", 200, sim_time);
+
+	free(chronosrt_on_exit_thread());
 }

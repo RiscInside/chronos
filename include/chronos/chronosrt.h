@@ -33,11 +33,17 @@ struct chronosrt_config {
 	} runtime_mode;
 };
 
-// Instantiate chronos runtime with a given configuration
-void chronosrt_instantiate(struct chronosrt_config *config);
+// TCB size
+extern const size_t chronosrt_tcb_size;
 
-// Create new thread control block (usually called before clone() or pthread_create())
-void *chronosrt_new_tcb(void);
+// Instantiate chronos runtime with a given configuration
+// NOTE: see chronosrt_init_new_tcb for the description of main_tcb_backing_memory
+void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backing_memory);
+
+// Initialize a thread control block (usually called before clone() or pthread_create()) in place
+// Returns backing_memory
+// NOTE: memory from backing_memory to backing_memory + chronosrt_tcb_size is claimed by the runtime
+void *chronosrt_init_new_tcb(void *backing_memory);
 
 // Call after clone() to submit a thread to the scheduler
 // NOTE: TCBs can be created with chronosrt_new_tcb()
@@ -50,6 +56,9 @@ void chronosrt_on_parent_thread_hook_p(void *tcb, pthread_t pthread);
 // Use a given TCB on this thread. Needs to be called before calling any other API functions on this this
 // thread
 void chronosrt_on_child_thread_hook(void *tcb);
+
+// Get pointer to the current thread's TCB
+void *chronosrt_get_tcb(void);
 
 // Set time dilation factor
 void chronosrt_set_tdf(double new_tdf);
@@ -79,8 +88,8 @@ size_t chronosrt_get_thread_running_time(void);
 // Get simulation time. Equivalent to gettimeofday() - simulation start time
 size_t chronosrt_get_sim_time(void);
 
-// Detach current thread to the framework
-void chronosrt_on_exit_thread(void);
+// Detach current thread to the framework. Returns a pointer to the TCB
+void *chronosrt_on_exit_thread(void);
 
 // Chronos runtime equivalent of sched_yield()
 void chronosrt_yield(void);
