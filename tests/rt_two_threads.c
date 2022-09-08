@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
 	chronos_spin_for_ms(200);
 
 	// Spawn a new thread
-	void *new_thread_tcb = chronosrt__tcb(malloc(chronosrt_tcb_size));
+	void *new_thread_tcb = chronosrt_init_new_tcb(malloc(chronosrt_tcb_size));
 	pthread_t pthread;
 	chronos_assert_false(pthread_create(&pthread, NULL, other_thread, new_thread_tcb));
 	chronos_assert_false(pthread_detach(pthread));
