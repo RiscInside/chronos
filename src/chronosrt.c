@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <trace_switch.skel.h>
 #include <unistd.h>
 #include <vruntime.h>
 
@@ -710,15 +711,19 @@ static void chronosrt_do_barrier_thread_spawn(void) {
 }
 
 void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backing_memory) {
-	// Step 0: Copy config over
+	// Step 0: Copy config over and figure out which scheduling priorities to use
 	cfg = *config;
-	// Step 1: Bump real-time rlimit for this process
+	chronosrt_priorities_query();
+	// Step 1: Bump real-time and mlock rlimits for this process
 	struct rlimit rlp;
 	rlp.rlim_cur = RLIM_INFINITY;
 	rlp.rlim_max = RLIM_INFINITY;
-	setrlimit(RLIMIT_RTTIME, &rlp);
-	// Step 2: Figure out what scheduling priority to use for the scheduler and normal threads
-	chronosrt_priorities_query();
+	chronos_assert_false(setrlimit(RLIMIT_RTTIME, &rlp));
+	chronos_assert_false(setrlimit(RLIMIT_MEMLOCK, &rlp));
+	// Step 2: Load BPF probe
+	struct trace_switch_bpf *skel = trace_switch_bpf__open_and_load();
+	chronos_assert(skel);
+	chronos_assert_false(trace_switch_bpf__attach(skel));
 	// Step 3: Figure out which CPU scheduler will run on
 	size_t scheduler_cpu = 0;
 	chronos_assert(chronos_cpuset_get_next_enabled(config->available_cpus, &scheduler_cpu));

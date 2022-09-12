@@ -20,11 +20,11 @@ libbpf/build/libbpf.a:
 build/vmlinux.h: build/keep
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > build/vmlinux.h
 
-build/vruntime_tunnel.bpf.o: build/keep build/vmlinux.h src/vruntime_tunnel.bpf.c
-	clang -g -c -target bpf -D__TARGET_ARCH_x86_64 -I build -o build/vruntime_tunnel.bpf.o src/vruntime_tunnel.bpf.c $(CFLAGS)
+build/trace_switch.bpf.o: build/keep build/vmlinux.h src/trace_switch.bpf.c src/trace_switch.h
+	clang -g -c -target bpf -D__TARGET_ARCH_x86_64 -I build -I src -o build/trace_switch.bpf.o src/trace_switch.bpf.c $(CFLAGS)
 
-build/vruntime_tunnel.skel.h: build/keep build/vruntime_tunnel.bpf.o
-	bpftool gen skeleton build/vruntime_tunnel.bpf.o > build/vruntime_tunnel.skel.h
+build/trace_switch.skel.h: build/keep build/trace_switch.bpf.o
+	bpftool gen skeleton build/trace_switch.bpf.o > build/trace_switch.skel.h
 
 build/ns.o: src/ns.c src/ns.h src/log.h
 	$(CC) -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
@@ -38,17 +38,17 @@ build/log.o: src/log.c src/log.h
 build/vruntime.o: src/vruntime.c src/vruntime.h src/log.h
 	$(CC) -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
 
-build/chronosrt.o: src/chronosrt.c build/keep build/vruntime_tunnel.skel.h include/chronos/chronosrt.h include/chronos/cpuset.h src/ns.h src/vruntime.h src/log.h src/pairing_heap.h
+build/chronosrt.o: src/chronosrt.c build/keep build/trace_switch.skel.h include/chronos/chronosrt.h include/chronos/cpuset.h src/ns.h src/vruntime.h src/log.h src/pairing_heap.h
 	$(CC) -Ibuild -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
 
 build/test_helpers.o: src/test_helpers.c build/keep src/ns.h include/chronos/chronosrt.h include/chronos/cpuset.h
 	$(CC) -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
 
-build/libchronosrt.a: libbpf/build/libbpf.a build/chronosrt.o build/ns.o build/cpuset.o build/vruntime.o build/log.o
+build/libchronosrt.a: build/chronosrt.o build/ns.o build/cpuset.o build/vruntime.o build/log.o
 	$(AR) rc $@ $^
 
-build/%: tests/%.c build/keep build/test_helpers.o build/libchronosrt.a
-	$(CC) -o $@ -g -Isrc -Iinclude $< build/test_helpers.o build/libchronosrt.a -latomic
+build/%: tests/%.c build/keep build/test_helpers.o build/libchronosrt.a libbpf/build/libbpf.a
+	$(CC) -o $@ -g -Isrc -Iinclude $< build/test_helpers.o build/libchronosrt.a libbpf/build/libbpf.a -lelf -lz -latomic
 
 build-test: \
 	build/rt_test_helpers \
