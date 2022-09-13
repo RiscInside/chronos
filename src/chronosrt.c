@@ -387,10 +387,6 @@ static bool chronosrt_cont_running_tasks(struct chronosrt_vcpu *vcpu) {
 	chronos_vruntime_update_real(&vcpu->current->vruntime, current_real_time);
 	// Resume task
 	chronosrt_resume(vcpu->current);
-	// LOOK INTO THIS
-	if (atomic_load(&vcpu->current->state) == START_PENDING) {
-		atomic_store(&vcpu->current->state, NORMAL);
-	}
 	return true;
 }
 
@@ -484,6 +480,9 @@ static void chronosrt_check_for_local_calls(struct chronosrt_vcpu *vcpu) {
 		struct chronosrt_tcb *new_tcb = current->thread_spawn_tcb;
 		// Set new thread's affinity to the scheduler mask to prevent it from running
 		chronosrt_suspend(new_tcb);
+		// Allow new thread to continue as soon as scheduler picks it up
+		// NOTE: new thread is waiting for new_tcb->state to become normal in chronosrt_wait_for_normal()
+		atomic_store(&new_tcb->state, NORMAL);
 		// Switch to real-time scheduling policy
 		chronosrt_make_realtime(new_tcb);
 		// Set vruntime to minimum_vruntime of the core. This should prevent new thread from starving others
