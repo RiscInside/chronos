@@ -13,10 +13,18 @@ struct chronos_switch_event {
 	chronos_tcb_addr_t tcb_addr;
 	// vCPU TCB belongs to
 	chronos_vcpu_index_t vcpu;
+	// Timestamp
+	size_t ts;
+	// CPU id event originates from
+	size_t cpu;
 	// Event type
 	enum {
 		// Thread has finished its execution
 		CHRONOS_SWITCH_EV_EXIT = 0,
+		// Thread is blocked on something/sleeping
+		CHRONOS_SWITCH_EV_SUSPEND = 1,
+		// Thread has been woken up
+		CHRONOS_SWITCH_EV_RESUME = 2,
 	} ty;
 };
 

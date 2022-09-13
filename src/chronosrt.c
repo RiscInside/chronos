@@ -239,10 +239,8 @@ static struct chronosrt_vcpu *chronosrt_best_vcpu(void) {
 
 // Wait for scheduler to migrate current thread from START_PENDING to NORMAL state
 static void chronosrt_wait_for_normal(struct chronosrt_tcb *tcb) {
-	size_t loads_count = 0;
 	while (atomic_load(&tcb->state) == START_PENDING) {
 		sched_yield();
-		loads_count++;
 	}
 }
 
@@ -602,11 +600,23 @@ static int chronosrt_handle_trace_switch_event(void *ctx, void *data, size_t sz)
 		// Unblock the core after exit
 		chronosrt_unblock_on_exit(vcpu);
 	} break;
+	// NOTE: we should not be getting suspend/resume events now, if you get any in the tests its most likely a page
+	// fault or a bug
+	case CHRONOS_SWITCH_EV_RESUME: {
+		// Get pointer to the TCB
+		struct chronosrt_tcb *tcb = (struct chronosrt_tcb *)ev->tcb_addr;
+		chronos_raw_log("resume(%p, %zu, %zu)", tcb, ev->ts, ev->cpu);
+	} break;
+	case CHRONOS_SWITCH_EV_SUSPEND: {
+		// Get pointer to the TCB
+		struct chronosrt_tcb *tcb = (struct chronosrt_tcb *)ev->tcb_addr;
+		chronos_raw_log("suspend(%p, %zu, %zu)", tcb, ev->ts, ev->cpu);
+	} break;
 	default:
-		// Unknown event type
 		chronos_assert(false);
+		break;
 	}
-	return 1;
+	return 0;
 }
 
 // Finish initialization on the main thread
@@ -831,7 +841,6 @@ void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backi
 	main_tcb->handle.tid = gettid();
 	main_tcb->creation_vruntime = 0;
 	main_tcb->yield_vruntime_diff = 0;
-	chronosrt_set_tcb_ptr(main_tcb);
 	// Step 7: Make main thread runnable by enqueuing it into runqueue
 	chronosrt_rq_enqueue(main_tcb->vcpu, main_tcb);
 	// Step 8: Spin-up scheduler thread
@@ -843,7 +852,8 @@ void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backi
 	chronosrt_fifo_bump_pthread(scheduler_pthread, scheduler_priority);
 	chronosrt_fifo_bump_pthread(barrier_pthread, barrier_priority);
 	// Step 11: Wait for the scheduler to give main thread a chance to run
-	chronosrt_wait_for_normal(main_tcb);
+	chronosrt_on_child_thread_hook(main_tcb);
+	chronos_rt_log("Main thread leaving chronosrt_instantiate()");
 }
 
 ////// API implementation ///////
@@ -863,8 +873,8 @@ void chronosrt_on_child_thread_hook(void *param) {
 	if (cfg.runtime_mode == NOP) {
 		return; // Didn't ask
 	}
-	chronosrt_set_tcb_ptr(param);
 	chronosrt_wait_for_normal(param);
+	chronosrt_set_tcb_ptr(param);
 }
 
 // Submit new thread to the scheduler with a global call
