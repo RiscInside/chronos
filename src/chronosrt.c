@@ -18,6 +18,8 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <trace_switch.h>
+#include <trace_switch.skel.h>
 #include <unistd.h>
 #include <vruntime.h>
 
@@ -90,6 +92,20 @@ struct chronosrt_vcpu {
 	size_t maximum_vruntime;
 	// Simulation time snapshot used for scheduling decisions
 	size_t sim_time_snapshot;
+	// vCPU state
+	enum {
+		// Capable of running tasks
+		// NOTE: state == ONLINE does not mean that CPU is currently running a task, the correct way to check for this
+		// would be state == ONLINE && current != NULL
+		// NOTE: simulation time for this vCPU only advances in this state
+		ONLINE,
+		// Frozen due to being way ahead in virtual time. "current" points to the task that CPU will run once its online
+		// again
+		FROZEN,
+		// Blocked, i.e. thread running on this vCPU has entered critical section. Scheduler can't touch vcpu->current
+		// while vcpu->state == BLOCKED. It follows that scheduler can't preempt currently running thread
+		BLOCKED,
+	} state;
 	// Set to true if vCPU has been frozen (to allow other vCPUs to catch up)
 	bool frozen;
 };
@@ -127,6 +143,10 @@ atomic_size_t sim_start_timestamp = 0; // Simulation start timestamp
 // Current timestamp
 size_t current_real_time = 0;
 
+// BPF maps
+struct ring_buffer *ev_ringbuffer; // Ringbuffer with events from BPF probe
+struct trace_switch_bpf *bpf_skel; // BPF skeleton
+
 ////// RT helpers //////
 
 // Move a given thread to the SCHED_FIFO scheduling class
@@ -141,20 +161,6 @@ static void chronosrt_fifo_bump_pthread(pthread_t pthread, int prio) {
 	struct sched_param param;
 	param.sched_priority = prio;
 	chronos_assert_false(pthread_setschedparam(pthread, SCHED_FIFO, &param));
-}
-
-// Move a given thread to the SCHED_OTHER scheduling class
-static void chronosrt_run_as_normal_tid(pid_t tid) {
-	struct sched_param param;
-	param.sched_priority = 0;
-	chronos_assert_false(sched_setscheduler(tid, SCHED_OTHER, &param));
-}
-
-// Move a given thread to the SCHED_OTHER scheduling class
-static void chronosrt_run_as_normal_pthread(pthread_t pthread) {
-	struct sched_param param;
-	param.sched_priority = 0;
-	chronos_assert_false(pthread_setschedparam(pthread, SCHED_OTHER, &param));
 }
 
 // Query RT priorities to be used by the runtime
@@ -186,6 +192,11 @@ void chronosrt_disable_signals() {
 ////// TCB helpers //////
 
 inline static void chronosrt_set_tcb_ptr(struct chronosrt_tcb *tcb) {
+	// Notify BPF probe that this thread is now part of the framework
+	pid_t key = gettid();
+	chronos_tcb_addr_t val = (chronos_tcb_addr_t)tcb;
+	chronos_assert_false(
+	    bpf_map__update_elem(bpf_skel->maps.tcb_ptrs, &key, sizeof(key), &val, sizeof(val), BPF_NOEXIST));
 #if defined(__x86_64)
 	chronos_assert_false(syscall(SYS_arch_prctl, ARCH_SET_GS, tcb));
 	tcb->self = tcb;
@@ -339,15 +350,6 @@ static void chronosrt_make_realtime(struct chronosrt_tcb *tcb) {
 	}
 }
 
-// Switch thread back to normal scheduling policy
-static void chronosrt_make_normal_again(struct chronosrt_tcb *tcb) {
-	if (tcb->pthread_mode) {
-		chronosrt_run_as_normal_pthread(tcb->handle.pthread);
-	} else {
-		chronosrt_run_as_normal_tid(tcb->handle.tid);
-	}
-}
-
 // Stop task from running on a given virtual CPU
 // PRE: current task exists
 static void chronosrt_stop_running_tasks(struct chronosrt_vcpu *vcpu, bool enqueue, bool suspend) {
@@ -396,8 +398,9 @@ static bool chronosrt_cont_running_tasks(struct chronosrt_vcpu *vcpu) {
 
 // Freeze vCPU
 static void chronosrt_freeze_vcpu(struct chronosrt_vcpu *vcpu) {
+	chronos_assert(vcpu->state == ONLINE);
 	chronos_rt_log("Freezing vCPU #%zu", ID(vcpu));
-	vcpu->frozen = true;
+	vcpu->state = FROZEN;
 	size_t new_vruntime = vcpu->current->vruntime_snapshot;
 	vcpu->sim_time += new_vruntime - vcpu->current_timeslice_start;
 	chronosrt_suspend(vcpu->current);
@@ -405,22 +408,23 @@ static void chronosrt_freeze_vcpu(struct chronosrt_vcpu *vcpu) {
 
 // Unfreeze vCPU
 static void chronosrt_unfreeze_vcpu(struct chronosrt_vcpu *vcpu) {
+	chronos_assert(vcpu->state == FROZEN);
 	chronos_rt_log("Unfreezing vCPU #%zu", ID(vcpu));
-	vcpu->frozen = false;
+	vcpu->state = ONLINE;
 	vcpu->current_timeslice_start = vcpu->current->vruntime_snapshot;
 	chronos_vruntime_update_real(&vcpu->current->vruntime, current_real_time);
 	chronosrt_resume(vcpu->current);
 }
 
-// Trigger preemption on a CPU
+// Trigger preemption on vCPU
 static void chronosrt_preempt_on_cpu(struct chronosrt_vcpu *vcpu) {
 	chronosrt_stop_running_tasks(vcpu, true, true);
 	chronosrt_cont_running_tasks(vcpu);
 }
 
-// Commit vruntime on the CPU
+// Commit vruntime on vCPU
 static void chronosrt_commit_vruntime_on_vcpu(struct chronosrt_vcpu *vcpu) {
-	if (vcpu->current == NULL || vcpu->frozen) {
+	if (vcpu->current == NULL || vcpu->state != ONLINE) {
 		return;
 	}
 	vcpu->current->vruntime_snapshot = chronos_vruntime_get(&vcpu->current->vruntime, current_real_time);
@@ -428,7 +432,7 @@ static void chronosrt_commit_vruntime_on_vcpu(struct chronosrt_vcpu *vcpu) {
 
 // Check if the timeslice of the current task has expired
 static void chronosrt_check_for_timeslice_expiration(struct chronosrt_vcpu *vcpu) {
-	if (vcpu->current == NULL || vcpu->frozen) {
+	if (vcpu->current == NULL || vcpu->state != ONLINE) {
 		return;
 	}
 	size_t current_vruntime = vcpu->current->vruntime_snapshot;
@@ -455,28 +459,27 @@ static void chronosrt_check_for_timeslice_expiration(struct chronosrt_vcpu *vcpu
 // Check for pending local calls from current task on a given vCPU
 // NOTE: local calls are the main mechanism via which tasks talk to a scheduler to terminate, spawn new threads, etc
 static void chronosrt_check_for_local_calls(struct chronosrt_vcpu *vcpu) {
-	if (vcpu->current == NULL || vcpu->frozen) {
+	if (vcpu->current == NULL || vcpu->state != ONLINE) {
 		return;
 	}
 	struct chronosrt_tcb *current = vcpu->current;
 	enum chronosrt_task_state state = atomic_load(&current->state);
-	if (state != NORMAL) {
-		chronos_rt_log("Local call handler for vCPU #%zu: Picked up local call request", ID(vcpu));
+	if (state == NORMAL) {
+		return;
 	}
+	chronos_rt_log("Local call handler for vCPU #%zu: Picked up local call request", ID(vcpu));
 	switch (state) {
 	case EXIT_THREAD_PENDING:
-		// Update timing statistics
-		chronosrt_stop_running_tasks(vcpu, false, false);
-		// Switch terminating task to the normal scheduling policy. This will allow tasks to clean up without stopping
-		// other threads in the simulation from running
-		chronosrt_make_normal_again(current);
-		// We are no longer using current, so we can tell the terminating thread to begin cleanup
-		atomic_store(&current->state, NORMAL);
+		chronos_rt_log("Blocking vCPU #%zu", ID(vcpu));
 		// Tell the load balancer this CPU now has one task less
 		atomic_fetch_sub(&vcpu->runnable_tasks, 1);
-		// Pick a new task to run
-		chronosrt_cont_running_tasks(vcpu);
-		chronos_rt_log("Local call handler for vCPU #%zu: Handled exit local call from thread %p", ID(vcpu), current);
+		// Switch vCPU to the blocked state
+		vcpu->state = BLOCKED;
+		// Pointer to current is of no use now (thread can free TCB at any point once local call is returned), might as
+		// well set it to NULL to catch some bugs
+		vcpu->current = NULL;
+		// Allow thread to continue in non-interruptable state
+		atomic_store(&current->state, NORMAL);
 		break;
 	case THREAD_SPAWN_PENDING: {
 		// Get new TCB to be enqueued
@@ -490,8 +493,8 @@ static void chronosrt_check_for_local_calls(struct chronosrt_vcpu *vcpu) {
 		// NOTE: we also need to compare min_vruntime for the core with the runtime of the current task on this core
 		// There are two cases where not doing this would be unfair
 		// 1. If current thread is substantially behind all threads in the runqueue
-		// 2. If current thread is the only runnable thread (i.e. runqueue is empty) and hence min_vruntime has not been
-		// updated in ages
+		// 2. If current thread is the only runnable thread (i.e. runqueue is empty) and hence min_vruntime has not
+		// been updated in ages
 		if (new_tcb->vcpu->current != NULL) {
 			struct chronosrt_tcb *new_tcb_vcpu_current = new_tcb->vcpu->current;
 			// NOTE: we assume that vruntime was comitted relatively recently (during stage 0 of the main loop)
@@ -553,14 +556,15 @@ static void chronosrt_check_for_local_calls(struct chronosrt_vcpu *vcpu) {
 
 // Compute simulation time for a given vCPU
 static bool chronosrt_compute_sim_time(struct chronosrt_vcpu *vcpu) {
-	if (vcpu->current == NULL) {
+	if (vcpu->state == ONLINE && vcpu->current == NULL) {
 		// Simulation time can only be computed for non-idle CPUs
 		return false;
-	} else if (vcpu->frozen) {
+	} else if (vcpu->state != ONLINE) {
 		// Simulation time stopped at vcpu->sim_time
 		vcpu->sim_time_snapshot = vcpu->sim_time;
 		return true;
 	}
+	chronos_assert(vcpu->current != NULL);
 	// We start computing simulation time with simulation time at the beginning of the timeslice
 	size_t result = vcpu->sim_time;
 	// Now we need to add the difference between timeslice start timestamp and current timestamp
@@ -570,6 +574,39 @@ static bool chronosrt_compute_sim_time(struct chronosrt_vcpu *vcpu) {
 	// Store the result in the snapshot variable
 	vcpu->sim_time_snapshot = result;
 	return true;
+}
+
+// Transfer vCPU from BLOCKED state to ONLINE state after thread exit notification from BPF probe
+static void chronosrt_unblock_on_exit(struct chronosrt_vcpu *vcpu) {
+	// TODO: thread termination probably should not be free (it currently is). The problem is that vcpu->current is
+	// gone, so we can't calculate new virtual time of the terminated thread. Is there any way to handle this?
+
+	// For now the only thing we can do is just wake up the CPU and tell it to pick a new task to run
+	chronos_rt_log("Unblocking vCPU #%zu", ID(vcpu));
+	vcpu->state = ONLINE;
+	chronosrt_cont_running_tasks(vcpu);
+}
+
+// Handle an event from BPF probe
+static int chronosrt_handle_trace_switch_event(void *ctx, void *data, size_t sz) {
+	(void)ctx; // Unused
+	chronos_assert(sizeof(struct chronos_switch_event) == sz);
+	struct chronos_switch_event *ev = data;
+	// Switch on event type
+	switch (ev->ty) {
+	case CHRONOS_SWITCH_EV_EXIT: {
+		// Get pointer to the vCPU task runs on
+		struct chronosrt_vcpu *vcpu = vcpus + ev->vcpu;
+		// Tasks can only terminate in blocked state
+		chronos_assert(vcpu->state == BLOCKED);
+		// Unblock the core after exit
+		chronosrt_unblock_on_exit(vcpu);
+	} break;
+	default:
+		// Unknown event type
+		chronos_assert(false);
+	}
+	return 1;
 }
 
 // Finish initialization on the main thread
@@ -639,22 +676,28 @@ static void *chronosrt_scheduler_thread(void *param) {
 		// Step 5. Determine which vCPUs should be (un)frozen
 		for (size_t i = 0; i < vcpus_count; ++i) {
 			struct chronosrt_vcpu *vcpu = vcpus + i;
-			if (vcpu->frozen && vcpu->sim_time_snapshot < (new_gvt + cfg.resume_lag_allowance)) {
+			// Check criteria for suspending/resuming vCPU from freeze
+			// NOTE: we need to prevent idle CPUs from getting suspended
+			if ((vcpu->state == FROZEN) && vcpu->sim_time_snapshot < (new_gvt + cfg.resume_lag_allowance)) {
 				// Frozen vCPU with vruntime mismatch less than resume lag allowance
 				// Wake vCPU up
 				chronosrt_unfreeze_vcpu(vcpu);
-			} else if (!vcpu->frozen && vcpu->sim_time_snapshot > (new_gvt + cfg.suspend_lag_allowance)) {
+			} else if (vcpu->state == ONLINE && vcpu->current != NULL &&
+			           vcpu->sim_time_snapshot > (new_gvt + cfg.suspend_lag_allowance)) {
 				// vCPU with vruntime mismatch more than suspend lag allowance
 				// Freeze vCPU
 				chronosrt_freeze_vcpu(vcpu);
 			}
 		}
+		// Step 5. Consume new events in the ring buffer
+		ring_buffer__consume(ev_ringbuffer);
 
 		atomic_fetch_add(&loops_done, 1);
 	}
 
 	return NULL;
 }
+
 // Spawn a real-time thread on scheduler core
 static pthread_t chronosrt_spawn_on_scheduler_core(void *(*routine)(void *), void *arg) {
 	pthread_t result;
@@ -709,16 +752,30 @@ static void chronosrt_do_barrier_thread_spawn(void) {
 	barrier_pthread = chronosrt_spawn_on_scheduler_core((void *)chronosrt_barrier_thread_routine, NULL);
 }
 
+// Set up BPF-related stuff
+static void chronosrt_bpf_setup(void) {
+	// Load BPF probe
+	bpf_skel = trace_switch_bpf__open_and_load();
+	chronos_assert(bpf_skel);
+	// Set up ringbuffer and BPF maps
+	ev_ringbuffer =
+	    ring_buffer__new(bpf_map__fd(bpf_skel->maps.ev_ringbuffer), chronosrt_handle_trace_switch_event, NULL, NULL);
+	// Attach BPF probe to the tracepoint
+	chronos_assert_false(trace_switch_bpf__attach(bpf_skel));
+}
+
 void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backing_memory) {
-	// Step 0: Copy config over
+	// Step 0: Copy config over and figure out which scheduling priorities to use
 	cfg = *config;
-	// Step 1: Bump real-time rlimit for this process
+	chronosrt_priorities_query();
+	// Step 1: Bump real-time and mlock rlimits for this process
 	struct rlimit rlp;
 	rlp.rlim_cur = RLIM_INFINITY;
 	rlp.rlim_max = RLIM_INFINITY;
-	setrlimit(RLIMIT_RTTIME, &rlp);
-	// Step 2: Figure out what scheduling priority to use for the scheduler and normal threads
-	chronosrt_priorities_query();
+	chronos_assert_false(setrlimit(RLIMIT_RTTIME, &rlp));
+	chronos_assert_false(setrlimit(RLIMIT_MEMLOCK, &rlp));
+	// Step 2: Get BPF in here
+	chronosrt_bpf_setup();
 	// Step 3: Figure out which CPU scheduler will run on
 	size_t scheduler_cpu = 0;
 	chronos_assert(chronos_cpuset_get_next_enabled(config->available_cpus, &scheduler_cpu));
@@ -762,7 +819,7 @@ void chronosrt_instantiate(struct chronosrt_config *config, void *main_tcb_backi
 		vcpus[i].runnable_tasks = 0;
 		vcpus[i].maximum_vruntime = 0;
 		vcpus[i].minimum_vruntime = 0;
-		vcpus[i].frozen = false;
+		vcpus[i].state = ONLINE;
 	}
 	// Step 6: Create and register main's thread TCB
 	chronos_assert(main_tcb_backing_memory);
@@ -925,8 +982,16 @@ void *chronosrt_on_exit_thread(void) {
 	if (cfg.runtime_mode == NOP) {
 		return NULL; // Who asked?
 	}
+	// Notify scheduler this task will exit soon
 	struct chronosrt_tcb *my_tcb = chronosrt_get_tcb_ptr();
 	chronosrt_do_local_call(my_tcb, EXIT_THREAD_PENDING);
+	// We can now guarantee that current task won't be preempted
+	// Hence this task is not going to migrate between CPUs and ID(my_tcb->vcpu) is now constant
+	chronos_vcpu_index_t val = ID(my_tcb->vcpu);
+	// Tell BPF probe which CPU is exiting task is running on
+	pid_t key = gettid();
+	chronos_assert_false(
+	    bpf_map__update_elem(bpf_skel->maps.on_exit_mapped_to_vcpu, &key, sizeof(key), &val, sizeof(val), BPF_NOEXIST));
 	return my_tcb;
 }
 
