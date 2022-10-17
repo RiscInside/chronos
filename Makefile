@@ -1,4 +1,8 @@
+# This has to be rewritten to be more manageable. It works as a quick and dirty solution though
+
 CFLAGS = -Og -Wall -Werror -Wextra
+LIBBPF = libbpf/artifact/usr/lib64/libbpf.a
+LIBBPF_INCLUDES = -Ilibbpf/artifact/usr/include -Ilibbpf/include/uapi
 
 all: build/libchronosrt.a
 
@@ -11,11 +15,12 @@ build/keep:
 regen-libbpf:
 	$(RM) -r libbpf
 	git clone https://github.com/libbpf/libbpf
-	make -C libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=../build/libbpf DESTDIR=../build INCLUDEDIR= LIBDIR= UAPIDIR= install
+	make -C libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=build DESTDIR=../artifact install
 
-libbpf/build/libbpf.a:
+$(LIBBPF):
+	$(RM) -r libbpf
 	git clone https://github.com/libbpf/libbpf
-	make -C libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=../build/libbpf DESTDIR=../build INCLUDEDIR= LIBDIR= UAPIDIR= install
+	make -C libbpf/src BUILD_STATIC_ONLY=1 OBJDIR=build DESTDIR=../artifact install
 
 build/vmlinux.h: build/keep
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > build/vmlinux.h
@@ -39,7 +44,7 @@ build/vruntime.o: src/vruntime.c src/vruntime.h src/log.h
 	$(CC) -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
 
 build/chronosrt.o: src/chronosrt.c build/keep build/trace_switch.skel.h include/chronos/chronosrt.h include/chronos/cpuset.h src/ns.h src/vruntime.h src/log.h src/pairing_heap.h
-	$(CC) -Ibuild -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
+	$(CC) -Ibuild -Iinclude $(LIBBPF_INCLUDES) -Isrc -g -c -o $@ $< $(CFLAGS)
 
 build/test_helpers.o: src/test_helpers.c build/keep src/ns.h include/chronos/chronosrt.h include/chronos/cpuset.h
 	$(CC) -Iinclude -Isrc -g -c -o $@ $< $(CFLAGS)
@@ -47,8 +52,8 @@ build/test_helpers.o: src/test_helpers.c build/keep src/ns.h include/chronos/chr
 build/libchronosrt.a: build/chronosrt.o build/ns.o build/cpuset.o build/vruntime.o build/log.o
 	$(AR) rc $@ $^
 
-build/%: tests/%.c build/keep build/test_helpers.o build/libchronosrt.a libbpf/build/libbpf.a
-	$(CC) -o $@ -g -Isrc -Iinclude $< build/test_helpers.o build/libchronosrt.a libbpf/build/libbpf.a -lelf -lz -latomic
+build/%: tests/%.c build/keep build/test_helpers.o build/libchronosrt.a $(LIBBPF)
+	$(CC) -o $@ -g -Isrc -Iinclude $< build/test_helpers.o build/libchronosrt.a $(LIBBPF) -lelf -lz -latomic -lpthread
 
 build-test: \
 	build/rt_test_helpers \

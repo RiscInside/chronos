@@ -15,11 +15,11 @@ void *other_thread(void *tcb) {
 
 	// What is our thread's runtime?
 	size_t vruntime = chronosrt_get_thread_running_time();
-	chronos_test_log("Other thread's runtime after %zu ns under framework is %zu", 200, vruntime);
+	chronos_test_log("Other thread's runtime after %d ns under framework is %zu", 200, vruntime);
 
 	// What is our simulation time?
 	size_t sim_time = chronosrt_get_sim_time();
-	chronos_test_log("Simulation time after %zu ns (as measured from the other thread) under framework is %zu", 200,
+	chronos_test_log("Simulation time after %d ns (as measured from the other thread) under framework is %zu", 200,
 	                 sim_time);
 
 	// Exit this thread
@@ -45,11 +45,11 @@ int main(int argc, char **argv) {
 
 	// What is our thread runtime?
 	size_t vruntime = chronosrt_get_thread_running_time();
-	chronos_test_log("Thread's runtime after %zu ns under framework is %zu", 500, vruntime);
+	chronos_test_log("Thread's runtime after %d ns under framework is %zu", 500, vruntime);
 
 	// What is our simulation time?
 	size_t sim_time = chronosrt_get_sim_time();
-	chronos_test_log("Simulation time after %zu ns under framework is %zu", 500, sim_time);
+	chronos_test_log("Simulation time after %d ns under framework is %zu", 500, sim_time);
 
 	// How much time it does it take for the main loop to run?
 	size_t avg_loop_time = chronosrt_calc_avg_loop_duration();

@@ -26,11 +26,11 @@ int main(int argc, char **argv) {
 
 	// What is our runtime?
 	size_t vruntime = chronosrt_get_thread_running_time();
-	chronos_test_log("Thread's runtime after %zu ns under framework is %zu", 200, vruntime);
+	chronos_test_log("Thread's runtime after %d ns under framework is %zu", 200, vruntime);
 
 	// What is our simulation time?
 	size_t sim_time = chronosrt_get_sim_time();
-	chronos_test_log("Simulation time after %zu ns under framework is %zu", 200, sim_time);
+	chronos_test_log("Simulation time after %d ns under framework is %zu", 200, sim_time);
 
 	free(chronosrt_on_exit_thread());
 }

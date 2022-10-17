@@ -11,11 +11,11 @@ int main(int argc, char **argv) {
 
 	// What is our runtime?
 	size_t vruntime = chronosrt_get_thread_running_time();
-	chronos_test_log("Thread's runtime after %zu ns under framework is %zu", 200, vruntime);
+	chronos_test_log("Thread's runtime after %d ns under framework is %zu", 200, vruntime);
 
 	// What is our simulation time?
 	size_t sim_time = chronosrt_get_sim_time();
-	chronos_test_log("Simulation time after %zu ns under framework is %zu", 200, sim_time);
+	chronos_test_log("Simulation time after %d ns under framework is %zu", 200, sim_time);
 
 	// How much time it does it take for the main loop to run?
 	size_t avg_loop_time = chronosrt_calc_avg_loop_duration();
@@ -29,11 +29,11 @@ int main(int argc, char **argv) {
 
 	// What is our runtime now?
 	vruntime = chronosrt_get_thread_running_time();
-	chronos_test_log("Thread's runtime after another %zu ns (with TDF of 2) is %zu", 200, vruntime);
+	chronos_test_log("Thread's runtime after another %d ns (with TDF of 2) is %zu", 200, vruntime);
 
 	// What is our simulation time?
 	sim_time = chronosrt_get_sim_time();
-	chronos_test_log("Simulation time after another %zu ns (with TDF of 2) is %zu", 200, sim_time);
+	chronos_test_log("Simulation time after another %d ns (with TDF of 2) is %zu", 200, sim_time);
 
 	// Does change in TDF affect scheduler's latency in any way?
 	avg_loop_time = chronosrt_calc_avg_loop_duration();

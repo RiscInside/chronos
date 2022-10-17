@@ -3,6 +3,7 @@
 #endif
 
 #include <asm/prctl.h>
+#include <bpf/libbpf.h>
 #include <chronos/chronosrt.h>
 #include <log.h>
 #include <ns.h>
