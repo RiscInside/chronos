@@ -43,7 +43,6 @@ static void chronos_trace_switch_report_exit(chronos_vcpu_index_t vcpu_index) {
 	if (!event) {
 		// TODO: maybe it would be a good idea to use a separate notification channel to tell the runtime BPF probe has
 		// panicked?
-		bpf_printk("BPF probe: failed to submit exit notification");
 		return;
 	}
 
@@ -77,5 +76,3 @@ int tracepoint__sched__sched_switch(struct trace_event_raw_sched_switch *ctx) {
 
 	return 0;
 }
-
-char LICENSE[] SEC("license") = "GPL";
